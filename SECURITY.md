@@ -139,6 +139,25 @@ On a bus too old to supply a pidfd the daemon falls back to the pid and says
 so in the journal at startup. The `/proc` handle is just as stable there;
 what is weaker is the claim that the pid named the caller in the first place.
 
+**Why that degrades rather than refuses.** Refusing would be the stricter
+default, and the argument for it is good: a flag is a decision, a log line
+is not. Two things decide it the other way. The exposure lands outside the
+threat model — since the bus peer is the proxy and not the application, a
+stale pid needs an attacker who holds a bus connection of their own, and
+such a process is out of scope here because it can run `fusermount3`
+directly. And dbus 1.14 is what Debian stable and Ubuntu LTS ship, so
+refusing by default would switch the bridge off for most of the systems it
+exists for, to close a hole those systems' sandboxed applications cannot
+reach.
+
+So the strictness is available as a deliberate act instead: **`--require-pidfd`**
+refuses any caller the bus cannot hand over as a descriptor. It is the right
+setting for a deployment that does not need old buses, and it changes
+nothing on a bus that supplies pidfds — pinned by
+`require_pidfd_changes_nothing_on_a_bus_that_supplies_them`. What that test
+cannot cover is the refusal itself: this dbus always offers a pidfd, and
+faking one would be testing a mock rather than the daemon.
+
 ## The one that needed more than a check
 
 `fusermount3` resolves the mountpoint path *again* when it runs

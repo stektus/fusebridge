@@ -18,10 +18,25 @@ struct Args {
     lazy: bool,
     quiet: bool,
     version: bool,
+    help: bool,
+    /// `--auto-unmount` with no mount options: libfuse's *other* auto-unmount
+    /// arrangement, where it has already mounted by itself and wants the
+    /// helper to hang around as a watchdog. See `run`.
+    watchdog: bool,
     options: Vec<String>,
     mountpoint: Option<String>,
 }
 
+/// Parse the way `fusermount3` does, long options included.
+///
+/// Its `--help` lists only the short forms, but the long ones work
+/// (`--unmount --lazy -- x` behaves exactly like `-u -z -- x`, checked on
+/// 3.18.2) and libfuse uses them: unmounting is
+/// `--unmount --quiet --lazy -- <mountpoint>`, and that is the path a
+/// sandboxed application takes, since it is only reached after its own
+/// `umount2` was refused. An unrecognised option is an error here, as it is
+/// there — the previous catch-all quietly took `--unmount` for a mountpoint
+/// and turned an unmount request into a mount request.
 fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, String> {
     let mut args = Args::default();
     while let Some(arg) = it.next() {
@@ -31,27 +46,47 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, String> {
                     args.mountpoint = Some(mp);
                 }
             }
-            "--version" => args.version = true,
-            "-o" => {
+            "-h" | "--help" => args.help = true,
+            "-V" | "--version" => args.version = true,
+            "-u" | "--unmount" => args.unmount = true,
+            "-q" | "--quiet" => args.quiet = true,
+            "-z" | "--lazy" => args.lazy = true,
+            "--auto-unmount" => args.watchdog = true,
+            "-o" | "--options" => {
                 let val = it.next().ok_or("-o requires an argument")?;
                 args.options.extend(val.split(',').map(String::from));
             }
-            s if s.starts_with("-o") => {
+            s if s.starts_with("--options=") => {
+                args.options
+                    .extend(s["--options=".len()..].split(',').map(String::from));
+            }
+            s if s.starts_with("-o") && s.len() > 2 => {
                 args.options.extend(s[2..].split(',').map(String::from));
             }
-            s if s.starts_with('-') && s.len() > 1 && !s.starts_with("--") => {
+            s if s.starts_with("--") => return Err(format!("unrecognized option '{s}'")),
+            s if s.starts_with('-') && s.len() > 1 => {
                 for c in s.chars().skip(1) {
                     match c {
                         'u' => args.unmount = true,
                         'z' => args.lazy = true,
                         'q' => args.quiet = true,
                         'V' => args.version = true,
+                        'h' => args.help = true,
                         other => return Err(format!("unsupported option '-{other}'")),
                     }
                 }
             }
             other => args.mountpoint = Some(other.to_string()),
         }
+    }
+    // `--auto-unmount` together with mount options is an ordinary mount that
+    // also wants cleanup — the flag spelling of the `auto_unmount` mount
+    // option, which the daemon implements. Only the bare form, with nothing
+    // to mount, is the watchdog arrangement. libfuse only ever emits the
+    // bare form, but the helper accepts both and so does this.
+    if args.watchdog && !args.options.is_empty() {
+        args.watchdog = false;
+        args.options.push("auto_unmount".to_string());
     }
     Ok(args)
 }
@@ -63,8 +98,17 @@ fn call_error_message(e: &zbus::Error) -> String {
     }
 }
 
+const USAGE: &str = "fusermount3 (fusebridge-shim): [options] mountpoint\n\
+     Options:\n\
+     \x20-h, --help             print help\n\
+     \x20-V, --version          print version\n\
+     \x20-o, --options opt[,opt...]  mount options\n\
+     \x20-u, --unmount          unmount\n\
+     \x20-q, --quiet            quiet\n\
+     \x20-z, --lazy             lazy unmount";
+
 fn run() -> Result<(), String> {
-    let args = parse_args(std::env::args().skip(1)).map_err(|e| format!("{e}\nusage: fusermount3 [-o opts] [--] mountpoint | fusermount3 -u [-z] [-q] [--] mountpoint"))?;
+    let args = parse_args(std::env::args().skip(1)).map_err(|e| format!("{e}\n{USAGE}"))?;
 
     if args.version {
         println!(
@@ -73,6 +117,25 @@ fn run() -> Result<(), String> {
             BUS_NAME
         );
         return Ok(());
+    }
+
+    if args.help {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
+    // libfuse asks for this only after it has mounted by itself — a
+    // privileged path, which is not the one a sandbox takes. The bridge did
+    // not make that mount, and it removes only mounts it made, so promising
+    // to clean it up would be a promise it cannot keep. Say so instead.
+    if args.watchdog {
+        return Err(
+            "--auto-unmount without mount options asks this helper to watch over a mount \
+             somebody else made. The bridge removes only the mounts it made itself, so it \
+             will not do that. (A mount made through the bridge gets the same behaviour \
+             from the 'auto_unmount' mount option.)"
+                .into(),
+        );
     }
 
     let mountpoint = args.mountpoint.clone().ok_or("no mountpoint given")?;
@@ -117,10 +180,15 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether errors should be swallowed, decided without parsing: the parse
+/// may itself be what failed. `--quiet` counts, which is the spelling
+/// libfuse uses when unmounting.
+fn wants_quiet<I: Iterator<Item = String>>(mut args: I) -> bool {
+    args.any(|a| a == "--quiet" || (a.starts_with('-') && !a.starts_with("--") && a.contains('q')))
+}
+
 fn main() -> ExitCode {
-    let quiet = std::env::args()
-        .skip(1)
-        .any(|a| a == "-q" || (a.starts_with('-') && !a.starts_with("--") && a.contains('q')));
+    let quiet = wants_quiet(std::env::args().skip(1));
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -155,6 +223,74 @@ mod tests {
         let a = parse(&["-o", "ro", "--", "dir"]);
         assert_eq!(a.options, vec!["ro"]);
         assert_eq!(a.mountpoint.as_deref(), Some("dir"));
+    }
+
+    /// The form libfuse 3.18.2 actually uses to unmount, and the one a
+    /// sandboxed application reaches, since it is only tried after its own
+    /// `umount2` was refused. Taken for a mountpoint, it turned an unmount
+    /// into a mount.
+    #[test]
+    fn libfuse_long_unmount_form() {
+        // libfuse: fusermount3 --unmount --quiet --lazy -- /mnt/point
+        let a = parse(&["--unmount", "--quiet", "--lazy", "--", "/mnt/point"]);
+        assert!(a.unmount, "an unmount request must not become a mount");
+        assert!(a.quiet && a.lazy);
+        assert!(a.options.is_empty());
+        assert_eq!(a.mountpoint.as_deref(), Some("/mnt/point"));
+    }
+
+    /// libfuse's other auto-unmount arrangement: it mounted by itself and
+    /// wants the helper as a watchdog. Nothing to mount, so no options.
+    #[test]
+    fn libfuse_watchdog_form() {
+        // libfuse: fusermount3 --auto-unmount -- /mnt/point
+        let a = parse(&["--auto-unmount", "--", "/mnt/point"]);
+        assert!(a.watchdog, "the watchdog form must be recognised as such");
+        assert!(!a.unmount);
+        assert!(a.options.is_empty());
+        assert_eq!(a.mountpoint.as_deref(), Some("/mnt/point"));
+    }
+
+    /// With options it is an ordinary mount that also wants cleanup, which
+    /// is the mount option the daemon implements.
+    #[test]
+    fn auto_unmount_flag_with_options_is_the_mount_option() {
+        let a = parse(&["--auto-unmount", "-o", "rw", "--", "/mnt/point"]);
+        assert!(!a.watchdog);
+        assert_eq!(a.options, vec!["rw", "auto_unmount"]);
+    }
+
+    #[test]
+    fn long_option_forms() {
+        assert_eq!(
+            parse(&["--options", "rw,ro", "--", "/m"]).options,
+            ["rw", "ro"]
+        );
+        assert_eq!(
+            parse(&["--options=rw,ro", "--", "/m"]).options,
+            ["rw", "ro"]
+        );
+        assert!(parse(&["--version"]).version);
+        assert!(parse(&["--help"]).help);
+        assert!(parse(&["-h"]).help);
+    }
+
+    /// The real helper answers `unrecognized option '--x'` and fails; a
+    /// catch-all that took it for a mountpoint is how the unmount bug got in.
+    #[test]
+    fn quiet_is_honoured_in_both_spellings() {
+        let q = |v: &[&str]| wants_quiet(v.iter().map(|s| s.to_string()));
+        assert!(q(&["--unmount", "--quiet", "--lazy"]));
+        assert!(q(&["-u", "-q", "-z"]));
+        assert!(q(&["-uqz"]));
+        assert!(!q(&["--unmount", "--lazy"]));
+        assert!(!q(&["-o", "quiet_is_not_a_flag_here", "--", "/m"]));
+    }
+
+    #[test]
+    fn unknown_long_flag_is_rejected_not_taken_for_a_mountpoint() {
+        let err = parse_args(["--totally-bogus"].iter().map(|s| s.to_string())).unwrap_err();
+        assert!(err.contains("unrecognized option"), "{err}");
     }
 
     #[test]

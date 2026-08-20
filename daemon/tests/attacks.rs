@@ -563,6 +563,27 @@ fn without_auto_unmount_a_closed_socket_leaves_the_mount_alone() {
     assert!(!is_mounted(&dir));
 }
 
+/// `--require-pidfd` turns the pid fallback off. On a bus that does supply
+/// pidfds — dbus >= 1.16, which is what this suite runs on — it must change
+/// nothing at all, so that the strict setting is a safe thing to turn on.
+/// The refusal it causes on an older bus cannot be exercised here: this
+/// dbus always offers a pidfd, and pretending otherwise would test a mock.
+#[test]
+fn require_pidfd_changes_nothing_on_a_bus_that_supplies_them() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::with_args("strict", &["--allow-unsandboxed", "--require-pidfd"]);
+    let dir = fx.mkdir("drive");
+
+    fx.mount(&dir, &[])
+        .expect("a pinned caller must still be served under --require-pidfd");
+    assert!(is_mounted(&dir));
+    fx.unmount(&dir).expect("and must still be able to unmount");
+    assert!(!is_mounted(&dir));
+}
+
 /// A mount the daemon did not create is none of its business, even for a
 /// caller it would otherwise trust.
 #[test]

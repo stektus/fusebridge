@@ -153,7 +153,11 @@ sudo make install    # daemon, D-Bus activation file, systemd user service
 
 Nothing needs to be started: the first call from an application activates the
 daemon, which then allows mounts under `~/CloudDrives` (created if missing).
-`--allow-root <dir>` adds another root, `--max-mounts` changes the ceiling.
+`--allow-root <dir>` adds another root, `--max-mounts` changes the ceiling,
+and `--require-pidfd` refuses callers the bus cannot hand over as a
+descriptor rather than identifying them by pid — worth setting if every bus
+you care about is dbus 1.16 or newer, which Debian stable and Ubuntu LTS are
+not.
 
 Do not add systemd sandboxing to the unit. `NoNewPrivileges=` breaks the
 setuid helper — that is the very bug this project exists to route around —

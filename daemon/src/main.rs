@@ -98,6 +98,10 @@ struct Registry {
 struct State {
     allowed_roots: Vec<PathBuf>,
     allow_unsandboxed: bool,
+    /// Refuse callers the bus cannot hand over as a descriptor, rather than
+    /// falling back to their pid. Off by default: see the note by the
+    /// startup warning for why the default goes the other way.
+    require_pidfd: bool,
     max_mounts: usize,
     /// Separate bus connection for credential lookups: calling back into the
     /// serving connection from a handler would deadlock the blocking API.
@@ -152,7 +156,15 @@ impl State {
         let denied = |e: std::io::Error| zbus::fdo::Error::AccessDenied(format!("caller: {e}"));
         let pinned = match creds.process_fd() {
             Some(pidfd) => flatpak::pin_by_pidfd(pidfd.as_fd()).map_err(denied)?,
-            // dbus < 1.16 does not offer a pidfd; warned about once at startup.
+            // dbus < 1.16 does not offer a pidfd; warned about once at startup,
+            // and refused outright when the operator asked for that.
+            None if self.require_pidfd => {
+                return Err(zbus::fdo::Error::AccessDenied(
+                    "this bus cannot identify callers by descriptor (needs dbus >= 1.16) and \
+                     --require-pidfd is set"
+                        .into(),
+                ));
+            }
             None => {
                 let pid = creds.process_id().ok_or_else(|| {
                     zbus::fdo::Error::AccessDenied("caller pid unavailable".into())
@@ -913,9 +925,13 @@ fn print_usage() {
     eprintln!(
         "usage: fusebridged [--allow-root <dir>]... [--allow-unsandboxed]\n\
          \x20                  [--no-default-root] [--max-mounts <n>]\n\
+         \x20                  [--require-pidfd]\n\
          \n\
          Mountpoints are allowed only strictly inside the allowed roots\n\
-         (default: ~/CloudDrives, created if missing)."
+         (default: ~/CloudDrives, created if missing).\n\
+         \n\
+         --require-pidfd refuses callers the bus cannot hand over as a\n\
+         descriptor, instead of identifying them by pid. Needs dbus >= 1.16."
     );
 }
 
@@ -924,6 +940,7 @@ fn main() {
 
     let mut allowed_roots: Vec<PathBuf> = Vec::new();
     let mut allow_unsandboxed = false;
+    let mut require_pidfd = false;
     let mut default_root = true;
     let mut max_mounts = DEFAULT_MAX_MOUNTS;
 
@@ -951,6 +968,7 @@ fn main() {
                 }
             },
             "--allow-unsandboxed" => allow_unsandboxed = true,
+            "--require-pidfd" => require_pidfd = true,
             "--no-default-root" => default_root = false,
             "-h" | "--help" => {
                 print_usage();
@@ -1021,18 +1039,40 @@ fn main() {
         );
     }
 
+    // Why this degrades by default instead of refusing.
+    //
+    // The caller a Flatpak application presents to the bus is not the
+    // application but its xdg-dbus-proxy, and that helper does not hand its
+    // connection to anyone. So what the pid fallback loses is not a defence
+    // against the adversary this daemon is built for; it is a defence
+    // against a local process that already holds its own bus connection —
+    // which the threat model puts out of scope anyway, because it can run
+    // fusermount3 itself. Meanwhile dbus 1.14 is what Debian stable and
+    // Ubuntu LTS ship, so refusing by default would turn the bridge off for
+    // most of the people it is for, to close a hole they are not exposed to.
+    //
+    // The strictness is available to anyone who wants it, as a deliberate
+    // act rather than a line in a log: --require-pidfd.
     if own_pidfd == Some(false) {
-        warn!(
-            "this bus does not supply caller pidfds (needs dbus >= 1.16): callers are \
-             identified by pid, which a caller that hands off its connection and exits \
-             can make stale"
-        );
+        if require_pidfd {
+            error!(
+                "--require-pidfd is set but this bus does not supply caller pidfds \
+                 (needs dbus >= 1.16): every request will be refused"
+            );
+        } else {
+            warn!(
+                "this bus does not supply caller pidfds (needs dbus >= 1.16): callers are \
+                 identified by pid, which is sound as long as the peer stays alive for the \
+                 request. Pass --require-pidfd to refuse such callers instead"
+            );
+        }
     }
 
     let bridge = Bridge {
         state: Arc::new(State {
             allowed_roots,
             allow_unsandboxed,
+            require_pidfd,
             max_mounts,
             creds,
             registry: Mutex::new(Registry::default()),
