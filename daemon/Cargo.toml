@@ -1,0 +1,18 @@
+[package]
+name = "fusebridge-daemon"
+description = "Session D-Bus daemon that performs FUSE mounts for sandboxed apps under policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fusebridged"
+path = "src/main.rs"
+
+[dependencies]
+fusebridge-proto = { path = "../proto" }
+zbus = { workspace = true }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"

@@ -4,8 +4,14 @@ FUSE mounts for sandboxed apps — without handing the app the keys to the host.
 
 ## Status
 
-**Design stage. Nothing here works yet.** This README describes what is being
-built and why; the moment code lands, this line changes.
+**Working prototype.** The bridge (daemon + shim) performs a full
+mount → I/O → unmount cycle for an unmodified rclone running inside a Flatpak
+sandbox, with the mount visible to the whole host; policy denials (mountpoint
+outside the allowed roots, `allow_other`, non-Flatpak callers, missing D-Bus
+permission) are verified live. The zero-install fallback (layer 2 below) is
+verified live on KDE (kio-fuse/WebDAV) and GNOME (gvfs/SFTP). Not yet done:
+hardening tests against deliberate attacks (shadowing, TOCTOU races), D-Bus
+activation packaging, and the written spec.
 
 ## The problem
 
@@ -38,6 +44,53 @@ built is a narrow, auditable contract for requesting it. Three layers:
 3. **The spec** — a threat model (mountpoint shadowing, TOCTOU, foreign
    unmount) and a D-Bus interface written up as a draft for the portal issue
    above, with this repository as the reference implementation.
+
+## How the bridge works
+
+FUSE libraries (libfuse, go-fuse, bazil/fuse — hence rclone, borg, gocryptfs)
+do not call `mount(2)` themselves: they exec `fusermount3` with the
+`_FUSE_COMMFD` environment variable pointing at a unix socket and expect the
+opened `/dev/fuse` fd back over it. That socket is the entire contract, and
+fd passing is native to D-Bus. So:
+
+- **`fusebridge-shim`** is installed inside the sandbox as
+  `/app/bin/fusermount3`. It forwards the socket and the mount arguments to
+  the daemon over one D-Bus name. The application is not modified at all.
+- **`fusebridged`** runs on the host as a session daemon — no root, no
+  setuid. It checks policy, then runs the host's own `fusermount3`, which
+  performs the privileged step exactly as it would in a terminal and hands
+  the `/dev/fuse` fd straight back to the sandboxed FUSE library through the
+  forwarded socket. The filesystem daemon never leaves the sandbox.
+
+Policy enforced by the daemon, one journal line per operation:
+
+- the caller must be a Flatpak app (`/proc/<pid>/root/.flatpak-info`, same
+  uid); its app id is logged;
+- the mountpoint must be an empty, user-owned directory strictly inside an
+  allowed root (default `~/CloudDrives`) — this is the defence against
+  mounting over `~/.ssh` and similar shadowing attacks;
+- `allow_other`/`allow_root` options are refused;
+- after the mount the daemon re-checks what actually got mounted and where;
+  anything unexpected is immediately unmounted;
+- unmount is possible only for mounts created through the daemon, and only
+  by the same app id.
+
+## Try it
+
+```sh
+cargo build --release                                            # daemon
+cargo build --release -p fusebridge-shim \
+    --target x86_64-unknown-linux-musl                           # static shim
+
+# Host side:
+./target/release/fusebridged            # allows mounts under ~/CloudDrives
+
+# Application manifest (Flatpak):
+#   * bundle the shim as /app/bin/fusermount3
+#   * finish-args: --talk-name=io.github.stektus.FuseBridge1
+# The app's normal FUSE code path then just works:
+rclone mount remote: ~/CloudDrives/remote
+```
 
 ## License
 

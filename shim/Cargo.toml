@@ -1,0 +1,15 @@
+[package]
+name = "fusebridge-shim"
+description = "Drop-in fusermount3 replacement for sandboxed apps: forwards the mount to the fusebridge daemon over D-Bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fusebridge-shim"
+path = "src/main.rs"
+
+[dependencies]
+fusebridge-proto = { path = "../proto" }
+zbus = { workspace = true }
