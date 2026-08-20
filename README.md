@@ -4,14 +4,15 @@ FUSE mounts for sandboxed apps — without handing the app the keys to the host.
 
 ## Status
 
-**Working prototype.** The bridge (daemon + shim) performs a full
-mount → I/O → unmount cycle for an unmodified rclone running inside a Flatpak
-sandbox, with the mount visible to the whole host; policy denials (mountpoint
-outside the allowed roots, `allow_other`, non-Flatpak callers, missing D-Bus
-permission) are verified live. The zero-install fallback (layer 2 below) is
-verified live on KDE (kio-fuse/WebDAV) and GNOME (gvfs/SFTP). Not yet done:
-hardening tests against deliberate attacks (shadowing, TOCTOU races), D-Bus
-activation packaging, and the written spec.
+**Working prototype, hardened against the attacks it claims to stop.** The
+bridge (daemon + shim) performs a full mount → I/O → unmount cycle for an
+unmodified rclone running inside a Flatpak sandbox, with the mount visible to
+the whole host. Every policy rule is exercised by the test suite against a
+real daemon making real mounts, including the mountpoint-shadowing race
+described below. The zero-install fallback (layer 2) is verified live on KDE
+(kio-fuse/WebDAV) and GNOME (gvfs/SFTP). Not yet done: D-Bus activation and
+packaging, a second and third application beyond rclone, and the written
+spec for the portal issue.
 
 ## The problem
 
@@ -70,10 +71,73 @@ Policy enforced by the daemon, one journal line per operation:
   allowed root (default `~/CloudDrives`) — this is the defence against
   mounting over `~/.ssh` and similar shadowing attacks;
 - `allow_other`/`allow_root` options are refused;
+- a ceiling on live mounts (`--max-mounts`, 64 by default) keeps one app from
+  filling the session's mount table;
 - after the mount the daemon re-checks what actually got mounted and where;
   anything unexpected is immediately unmounted;
 - unmount is possible only for mounts created through the daemon, and only
-  by the same app id.
+  by the app that created them.
+
+## Security
+
+**Checking the path is not enough, so the daemon does not stop there.**
+`fusermount3` resolves the mountpoint again when it runs, and it only rejects
+a symlink in the *final* component. A caller that swaps a *parent* component
+for a symlink after the check — atomically, with
+`renameat2(RENAME_EXCHANGE)`, so the path is never missing — redirects the
+mount anywhere it likes. Verified against fuse 3.18.2: the mount landed on a
+directory outside the allowed root, one attempt in six.
+
+The daemon therefore resolves the path exactly once and keeps the resulting
+directory open, so the check describes an inode rather than a name. It then
+mounts on that descriptor (`fchdir` into it, `.` as the mountpoint) — which
+narrows the window but does not close it, because `fusermount3` turns any
+argument back into a path (`fuse_mnt_resolve_path`) and resolves it again
+before mounting. Nothing the daemon can pass avoids that.
+
+**So the daemon takes the `/dev/fuse` descriptor itself.** `fusermount3`
+reports to the daemon, not to the application: the descriptor is handed on
+only once the mount is confirmed to sit on the approved directory. Otherwise
+it is closed, which aborts the connection — a mount that landed somewhere
+else is dead on arrival, serves nothing to anybody, and is then removed. The
+attack turns from "shadow `~/.ssh` with a filesystem you control" into "make
+a directory answer ENOTCONN for a moment".
+
+Identifying that stray mount is done by three facts together, because the
+mount table belongs to the whole session: it did not exist when the operation
+started, its FUSE connection appeared while the helper ran (connection
+numbers are reused after an abort, so that alone proves nothing), and it died
+exactly when the daemon dropped the descriptor. A filesystem somebody else
+mounted at that moment is left alone.
+
+`cargo test` runs the attack suite in [daemon/tests/attacks.rs](daemon/tests/attacks.rs)
+against a real daemon on a private bus, making real FUSE mounts: escape
+outside the allowed root, the root itself, a non-empty mountpoint, a symlink
+and a parent symlink leading out, `allow_other`, a non-Flatpak caller,
+unmounting a mount the daemon did not create, the mount ceiling, and the race
+above driven by a tuned attacker. Every request in the suite also asserts the
+rule that makes the race survivable: a refused mount never leaves the
+application holding a descriptor. The race test additionally asserts that the
+attacker *did* get past the mountpoint check, so it cannot pass by accident.
+
+Known and deliberate limits:
+
+- **App ids identify sandboxed callers, nothing else.** A process that can
+  create a user namespace can chroot into a forged root and claim any app id;
+  verified by doing it, and by taking over another app's mount that way. It
+  gains nothing — such a process is unsandboxed and can run `fusermount3`
+  directly — and the callers this policy governs cannot do it: Flatpak's
+  seccomp filter refuses `unshare(CLONE_NEWUSER)` inside the sandbox, with
+  and without `--devel` (checked on flatpak 1.18.1).
+- **The daemon is single-threaded.** A mount request can hold it for up to
+  15 seconds, and a hung filesystem on the path to a mountpoint can block it
+  for longer. Not a hole, but a denial of service one app can inflict on
+  another; it wants a worker per request before this is fit to ship.
+- **A redirected mount still exists for a moment.** It is dead and unserved
+  from the instant it appears, and removed before the request returns, but
+  the window is real. Closing it properly needs `fusermount3` to accept a
+  directory descriptor instead of a path — which is one of the concrete
+  proposals this project takes to the portal issue.
 
 ## Try it
 

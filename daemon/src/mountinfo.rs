@@ -5,9 +5,16 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
+    /// The kernel's id for this mount. Unique among live mounts, so it says
+    /// whether a mount seen now is the same one that was seen earlier.
+    pub id: String,
     pub mount_point: PathBuf,
     pub fstype: String,
     pub source: String,
+    /// The mounted filesystem's device, as `major:minor`. For FUSE the minor
+    /// is the connection number under /sys/fs/fuse/connections, which is how
+    /// a mount can be tied to the descriptor that serves it.
+    pub dev: String,
 }
 
 /// Unescape the octal sequences mountinfo uses for special characters
@@ -47,12 +54,40 @@ pub fn parse(content: &str) -> Vec<MountEntry> {
             continue;
         }
         entries.push(MountEntry {
+            id: fields[0].to_string(),
             mount_point: PathBuf::from(unescape(fields[4])),
             fstype: fields[sep + 1].to_string(),
             source: unescape(fields[sep + 2]),
+            dev: fields[2].to_string(),
         });
     }
     entries
+}
+
+/// Every FUSE mount in the live mount table.
+pub fn fuse_mounts() -> std::io::Result<Vec<MountEntry>> {
+    let content = std::fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(parse(&content)
+        .into_iter()
+        .filter(|e| e.fstype.starts_with("fuse"))
+        .collect())
+}
+
+/// The FUSE connections the kernel currently has open, by number.
+///
+/// A connection appears here the moment `fusermount3` opens `/dev/fuse` and
+/// mounts, so comparing this before and after an operation names exactly the
+/// connection the daemon caused — and `dev` on a mount entry ties that
+/// connection to the mountpoint it ended up on, wherever that turned out
+/// to be.
+pub fn fuse_connections() -> std::io::Result<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    for entry in std::fs::read_dir("/sys/fs/fuse/connections")? {
+        if let Some(name) = entry?.file_name().to_str() {
+            ids.insert(format!("0:{name}"));
+        }
+    }
+    Ok(ids)
 }
 
 /// Read the live mountinfo and find the entry for `mount_point`, if any.
