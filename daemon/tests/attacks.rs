@@ -185,6 +185,46 @@ impl Fixture {
         result
     }
 
+    /// Mount the way an application asking for `auto_unmount` does: keep the
+    /// `_FUSE_COMMFD` socket open afterwards, which is how libfuse lets the
+    /// helper — here, the daemon — notice the application dying. Returns the
+    /// application's end of that socket, still open.
+    fn mount_holding_socket(&self, mountpoint: &Path, options: &[&str]) -> Result<RawFd, String> {
+        let (ours, theirs) = socketpair();
+        let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+        let result = {
+            // SAFETY: `theirs` stays open until it is closed below.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(theirs) };
+            self.proxy()
+                .call::<_, _, ()>(
+                    "Mount",
+                    &(
+                        &opts,
+                        mountpoint.display().to_string(),
+                        zbus::zvariant::Fd::from(borrowed),
+                    ),
+                )
+                .map_err(|e| error_text(&e))
+        };
+        unsafe { libc::close(theirs) };
+        let received = recv_fd(ours);
+        if let Some(fd) = received {
+            self.served.lock().unwrap().push(fd);
+        }
+        assert_eq!(
+            received.is_some(),
+            result.is_ok(),
+            "a failed mount handed over a fuse descriptor anyway: {result:?}"
+        );
+        match result {
+            Ok(()) => Ok(ours),
+            Err(e) => {
+                unsafe { libc::close(ours) };
+                Err(e)
+            }
+        }
+    }
+
     /// Close the handed-over descriptors, the way an application stops
     /// serving before it unmounts. A FUSE mount whose server is still
     /// attached but answering nothing cannot be unmounted the ordinary way —
@@ -436,6 +476,88 @@ fn mounts_and_unmounts_a_clean_mountpoint() {
         .expect("ListMounts must work");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, dir.display().to_string());
+
+    fx.unmount(&dir).expect("its own mount must unmount");
+    assert!(!is_mounted(&dir));
+}
+
+/// `auto_unmount` means what it says: the application goes away and the
+/// mount goes with it, with nobody calling Unmount.
+///
+/// The helper cannot do this through the bridge — it would be watching the
+/// daemon's socket rather than the application's — so the daemon takes the
+/// option for itself and watches the application's own socket, which
+/// libfuse keeps open precisely when this option was asked for.
+#[test]
+fn auto_unmount_removes_the_mount_when_the_application_dies() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("autounmount");
+    let dir = fx.mkdir("drive");
+
+    let app_socket = fx
+        .mount_holding_socket(&dir, &["auto_unmount"])
+        .expect("auto_unmount must be accepted, not refused");
+    assert!(is_mounted(&dir), "the mount must be visible to the host");
+
+    // Still there while the application lives: nothing has closed yet.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        is_mounted(&dir),
+        "the mount went away while the application was still alive\n{}",
+        fx.journal()
+    );
+
+    // The application dies: it stops serving and its sockets close.
+    fx.stop_serving();
+    unsafe { libc::close(app_socket) };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while is_mounted(&dir) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !is_mounted(&dir),
+        "the mount outlived the application despite auto_unmount\n{}",
+        fx.journal()
+    );
+
+    // And the daemon has forgotten it, rather than leaving a record behind.
+    let listed: Vec<(String, String, String, String)> = fx
+        .proxy()
+        .call("ListMounts", &())
+        .expect("ListMounts must work");
+    assert!(
+        listed.is_empty(),
+        "a removed mount is still listed: {listed:?}"
+    );
+}
+
+/// Without the option, the same socket closing must change nothing: an
+/// application that merely finished handing over is not one that has died,
+/// and unmounting there would be the bridge inventing a policy of its own.
+#[test]
+fn without_auto_unmount_a_closed_socket_leaves_the_mount_alone() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("noauto");
+    let dir = fx.mkdir("drive");
+
+    let app_socket = fx
+        .mount_holding_socket(&dir, &[])
+        .expect("a clean mountpoint must mount");
+    unsafe { libc::close(app_socket) };
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        is_mounted(&dir),
+        "the mount was removed although auto_unmount was not asked for\n{}",
+        fx.journal()
+    );
 
     fx.unmount(&dir).expect("its own mount must unmount");
     assert!(!is_mounted(&dir));

@@ -82,7 +82,7 @@ happens outside, and the `/dev/fuse` descriptor is passed back in.
 | Make other applications wait | Every request is served on its own worker; mountpoints are claimed so two requests cannot race for one | `a_stuck_request_does_not_hold_up_another_application`, `several_applications_can_mount_at_once` |
 | Impersonate another app by pid reuse, or by handing the bus connection to another process and exiting | The caller is pinned by the pidfd the bus captured together with the pid, confirmed still current after `/proc/<pid>` is opened; uid and app id are then both read through that one handle | `a_pidfd_pins_this_process`, `a_pidfd_whose_process_died_is_refused`, `dead_pid_is_an_error_not_an_identity`, and see below |
 | Have the daemon unmount somebody else's filesystem | A mount is removed only if it went from connected to disconnected exactly when the daemon dropped its descriptor | `only_a_mount_that_died_with_our_descriptor_is_ours`, `a_stranger_s_filesystem_is_never_unmounted` |
-| Be handed a mount option that quietly does nothing | `auto_unmount` is refused, because the bridge holds the socket the helper watches | `refuses_auto_unmount_rather_than_pretending` |
+| A mount outliving the application that asked for it | `auto_unmount` is honoured by the daemon itself: it watches the application's own socket and removes the mount when that closes | `auto_unmount_removes_the_mount_when_the_application_dies`, `without_auto_unmount_a_closed_socket_leaves_the_mount_alone`, `auto_unmount_is_taken_by_the_daemon_not_passed_on` |
 
 The tests live in [daemon/tests/attacks.rs](daemon/tests/attacks.rs) and
 `daemon/src/*.rs`; `cargo test` runs them against a real daemon on a private
@@ -258,11 +258,16 @@ upstream, and one of the concrete proposals this project carries to
   looking once lost the race often enough to leave the mount there for good.
   If the removal itself fails, the daemon says so in the journal
   (`could not remove misplaced mounts`) rather than passing over it.
-- **`auto_unmount` is refused, not supported.** The option asks the helper to
-  unmount when the application dies, which it detects by the `_FUSE_COMMFD`
-  socket closing. The bridge holds that socket, so the signal never arrives.
-  Supporting it would mean the daemon watching the application's own socket
-  for end-of-file and unmounting then — worth doing, not done.
+- **`auto_unmount` rests on what libfuse does with its socket.** The daemon
+  removes the mount when the application's `_FUSE_COMMFD` socket reaches
+  end-of-file, which is a sound signal only because libfuse keeps that
+  socket open exactly when `auto_unmount` was requested and closes it
+  immediately otherwise (`fuse_mount_fusermount`). A library that kept the
+  socket open without asking for the option would get no cleanup; one that
+  closed it early while asking for it would have its mount taken down under
+  it. Neither is libfuse's behaviour, and the option is never acted on
+  unless it was asked for — but this is somebody else's convention, not a
+  guarantee this daemon can make.
 - **Forgetting a mount is possible in principle.** The kernel builds
   `/proc/self/mountinfo` as it is read, so a reading taken while the session
   is mounting and unmounting can come back without an entry that was there

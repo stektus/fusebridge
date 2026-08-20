@@ -75,6 +75,10 @@ struct MountRecord {
     /// life of the mount: a helper that is still watching it must not see it
     /// close early.
     _comm: OwnedFd,
+    /// Write end of the pipe that tells an `auto_unmount` watcher to stop.
+    /// Dropping this record closes it, which is the signal — so a mount
+    /// removed any other way does not leave a thread behind.
+    _watcher_stop: Option<OwnedFd>,
 }
 
 struct Caller {
@@ -339,6 +343,89 @@ impl State {
             .collect()
     }
 
+    /// Watch an application's `_FUSE_COMMFD` socket and remove its mount when
+    /// the application is gone — what `auto_unmount` asks for.
+    ///
+    /// The helper cannot do this through the bridge, because the socket it
+    /// would watch is the daemon's. The application's own socket is right
+    /// here, though: libfuse holds its end open for the life of the session
+    /// when `auto_unmount` was requested, so end-of-file on this end means
+    /// the application has died, and nothing else does.
+    ///
+    /// The thread owns both descriptors, so nothing it waits on can be
+    /// closed underneath it. It stops either way: on end-of-file it takes
+    /// the mount down, and on the record going away — an explicit unmount,
+    /// say — the other end of `stop` closes and it simply leaves.
+    fn watch_for_exit(self: &Arc<Self>, mp: PathBuf, comm: OwnedFd, stop: OwnedFd) {
+        let state = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut fds = [
+                libc::pollfd {
+                    fd: comm.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                // SAFETY: both descriptors are owned by this thread and stay
+                // open for the whole call.
+                let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    warn!("auto_unmount watcher for '{}' gave up: {err}", mp.display());
+                    return;
+                }
+                if fds[1].revents != 0 {
+                    return; // the mount is already gone
+                }
+                if fds[0].revents == 0 {
+                    continue;
+                }
+                // Readable, or hung up. Only a read of zero proves the far
+                // end is gone; anything else is data we have no use for.
+                let mut byte = [0u8; 1];
+                match fdpass::read_byte(comm.as_fd(), &mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        warn!("auto_unmount watcher for '{}' gave up: {e}", mp.display());
+                        return;
+                    }
+                }
+            }
+
+            let record = state.registry.lock().unwrap().mounts.remove(&mp);
+            let Some(record) = record else {
+                return; // somebody unmounted it first
+            };
+            // Release the record — and with it the helper's socket — before
+            // unmounting, so nothing is still holding the mount open.
+            let app_id = record.app_id.clone();
+            drop(record);
+            if state.force_unmount(&mp) {
+                info!(
+                    "auto_unmount app={app_id} mountpoint='{}': the application exited",
+                    mp.display()
+                );
+            } else {
+                error!(
+                    "auto_unmount app={app_id} mountpoint='{}': the application exited but the \
+                     mount could not be removed",
+                    mp.display()
+                );
+            }
+        });
+    }
+
     /// Remove mounts this operation made that did not land where they should.
     fn remove_misplaced(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
         let mut left_behind = Vec::new();
@@ -376,6 +463,11 @@ impl State {
         };
 
         policy::check_options(&options).map_err(&deny)?;
+        // Taken out of what the helper is given: through the bridge it would
+        // watch the daemon's socket, not the application's. The daemon does
+        // the watching instead, once the mount is up.
+        let auto_unmount = policy::wants_auto_unmount(&options);
+        let helper_options = policy::without_auto_unmount(&options);
 
         // Resolving comes before the lock: it can take a while, and holding
         // the registry meanwhile would make every other request wait.
@@ -450,8 +542,8 @@ impl State {
         let dir_fd = approved.dir.as_raw_fd();
         let theirs_raw = theirs.as_raw_fd();
         let mut cmd = Command::new(FUSERMOUNT);
-        if !options.is_empty() {
-            cmd.arg("-o").arg(options.join(","));
+        if !helper_options.is_empty() {
+            cmd.arg("-o").arg(helper_options.join(","));
         }
         cmd.arg("--")
             .arg(".")
@@ -605,13 +697,43 @@ impl State {
         }
         drop(fuse_fd);
 
+        // Set up the watcher before the mount is announced, so there is no
+        // moment where the mount exists and nothing is waiting on the
+        // application. If the pipe cannot be made, say so and carry on
+        // without it rather than failing a mount that otherwise worked.
+        let watcher_stop = if auto_unmount {
+            match fdpass::stop_pipe() {
+                Ok((stop_r, stop_w)) => {
+                    let app_socket = comm_fd.into();
+                    self.watch_for_exit(mp.clone(), app_socket, stop_r);
+                    Some(stop_w)
+                }
+                Err(e) => {
+                    error!(
+                        "auto_unmount app={} mountpoint='{}': cannot watch the application \
+                         ({e}); the mount will have to be removed by hand",
+                        caller.app_id,
+                        mp.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         info!(
-            "mount OK app={} pid={} mountpoint='{}' fstype={} source='{}'",
+            "mount OK app={} pid={} mountpoint='{}' fstype={} source='{}'{}",
             caller.app_id,
             caller.pid,
             mp.display(),
             entry.fstype,
-            entry.source
+            entry.source,
+            if watcher_stop.is_some() {
+                " auto_unmount=watching"
+            } else {
+                ""
+            }
         );
         self.registry.lock().unwrap().mounts.insert(
             mp,
@@ -621,6 +743,7 @@ impl State {
                 source: entry.source,
                 child,
                 _comm: ours,
+                _watcher_stop: watcher_stop,
             },
         );
         Ok(())

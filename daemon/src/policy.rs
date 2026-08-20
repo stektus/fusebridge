@@ -37,23 +37,41 @@ const MAX_STUCK_CHECKS: usize = 32;
 const FORBIDDEN_OPTIONS: &[&str] = &["allow_other", "allow_root"];
 
 /// Options the daemon cannot honour, and will not pretend to.
+const UNSUPPORTED_OPTIONS: &[(&str, &str)] = &[];
+
+/// The option the daemon honours itself rather than passing on.
 ///
-/// `auto_unmount` works by `fusermount3` outliving the mount and watching
-/// the `_FUSE_COMMFD` socket: it unmounts when that socket closes. Observed
-/// directly — asked for `auto_unmount`, the helper never exited, and it is
-/// how the session's own document portal keeps its mount.
-///
-/// Through the bridge that socket belongs to the daemon, not to the
-/// application: taking it is what lets a misplaced mount be caught before
-/// anyone can use it. So the socket now closes when the *daemon* is done
-/// with the mount, and the application's death — the event the option
-/// exists for — never reaches the helper. Refusing says so plainly;
-/// accepting would be a promise of cleanup that never comes.
-const UNSUPPORTED_OPTIONS: &[(&str, &str)] = &[(
-    "auto_unmount",
-    "the bridge holds the descriptor the helper watches, so the mount would \
-     outlive the application instead of being cleaned up; unmount explicitly",
-)];
+/// `auto_unmount` normally works by `fusermount3` outliving the mount and
+/// watching the `_FUSE_COMMFD` socket, unmounting when it closes. Handing
+/// that job to the helper does not work here, because through the bridge
+/// that socket is the daemon's: the helper would wait on the wrong end and
+/// the application's death — the event the option exists for — would never
+/// reach it. So the option is taken out of what the helper is given, and
+/// the daemon watches the application's own socket instead. libfuse keeps
+/// that socket open exactly when `auto_unmount` was asked for
+/// (`if (!mo->auto_unmount) { close(fds[1]); waitpid(...); }` in
+/// `fuse_mount_fusermount`), so end-of-file on it means the application is
+/// gone, and nothing else does.
+pub const AUTO_UNMOUNT: &str = "auto_unmount";
+
+fn option_key(opt: &str) -> &str {
+    opt.split('=').next().unwrap_or(opt).trim()
+}
+
+/// Did the caller ask the mount to be cleaned up when it dies?
+pub fn wants_auto_unmount(options: &[String]) -> bool {
+    options.iter().any(|o| option_key(o) == AUTO_UNMOUNT)
+}
+
+/// The options to actually give `fusermount3`: everything except the one
+/// the daemon implements itself.
+pub fn without_auto_unmount(options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .filter(|o| option_key(o) != AUTO_UNMOUNT)
+        .cloned()
+        .collect()
+}
 
 pub fn check_options(options: &[String]) -> Result<(), String> {
     for opt in options {
@@ -62,7 +80,7 @@ pub fn check_options(options: &[String]) -> Result<(), String> {
         // 3.18.2), but a rule this daemon enforces must not depend on the
         // spelling somebody else's parser tolerates. The option is still
         // passed on exactly as it arrived; only the comparison is trimmed.
-        let key = opt.split('=').next().unwrap_or(opt).trim();
+        let key = option_key(opt);
         if FORBIDDEN_OPTIONS.contains(&key) {
             return Err(format!("mount option '{key}' is not allowed"));
         }
@@ -281,7 +299,6 @@ mod tests {
             " allow_other",
             "\tallow_other\t",
             " allow_other =1",
-            " auto_unmount ",
         ] {
             assert!(
                 check_options(&[smuggled.into()]).is_err(),
@@ -297,11 +314,28 @@ mod tests {
         assert!(check_options(&["rw".into(), "fsname=my drive".into()]).is_ok());
     }
 
+    /// `auto_unmount` is accepted, recognised however it is spelled, and
+    /// never handed on to the helper — which through the bridge would watch
+    /// the wrong socket and so never fire.
     #[test]
-    fn refuses_auto_unmount_rather_than_pretending() {
-        let err = check_options(&["auto_unmount".into()]).unwrap_err();
-        assert!(err.contains("not supported"), "{err}");
-        assert!(err.contains("unmount explicitly"), "{err}");
+    fn auto_unmount_is_taken_by_the_daemon_not_passed_on() {
+        for spelling in ["auto_unmount", " auto_unmount ", "auto_unmount=1"] {
+            let opts = vec!["rw".to_string(), spelling.to_string(), "ro".to_string()];
+            assert!(check_options(&opts).is_ok(), "refused '{spelling}'");
+            assert!(wants_auto_unmount(&opts), "missed '{spelling}'");
+            assert_eq!(
+                without_auto_unmount(&opts),
+                vec!["rw".to_string(), "ro".to_string()],
+                "'{spelling}' survived into the helper's options"
+            );
+        }
+    }
+
+    #[test]
+    fn without_auto_unmount_leaves_everything_else_alone() {
+        let opts = vec!["rw".to_string(), "fsname=x".to_string()];
+        assert!(!wants_auto_unmount(&opts));
+        assert_eq!(without_auto_unmount(&opts), opts);
     }
 
     #[test]

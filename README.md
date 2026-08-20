@@ -13,11 +13,12 @@ exercised by the test suite against a real daemon making real mounts,
 including the mountpoint-shadowing race; the threat model is written down in
 [SECURITY.md](SECURITY.md). `make install` sets up D-Bus activation, verified
 by watching the daemon start on the first call. Requests are served
-concurrently, so no application can make another wait on it. The zero-install
+concurrently, so no application can make another wait on it. `auto_unmount`
+works: kill the application and its mount goes with it. The zero-install
 fallback (layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME
-(gvfs/SFTP). Not yet done: the written spec for the portal issue, and
-support for `auto_unmount`, which is refused for now rather than silently
-ignored.
+(gvfs/SFTP). It builds and passes its tests on clean Debian 12, Fedora 42 and
+Ubuntu 24.04 as well as the machine it was written on. Not yet done: the
+written spec for the portal issue.
 
 ## The problem
 
@@ -92,8 +93,10 @@ Policy enforced by the daemon, one journal line per operation:
 - `allow_other`/`allow_root` options are refused;
 - a ceiling on live mounts (`--max-mounts`, 64 by default) keeps one app from
   filling the session's mount table;
-- `auto_unmount` is refused rather than quietly ignored: the bridge holds the
-  socket the helper watches for it, so the mount would outlive the app;
+- `auto_unmount` is honoured by the daemon rather than passed on: through the
+  bridge the helper would be watching the daemon's socket instead of the
+  application's, so the daemon watches the application's own socket and takes
+  the mount down when the application is gone;
 - every request is served on its own worker, so one application waiting on a
   filesystem that never answers does not keep the others waiting;
 - after the mount the daemon re-checks what actually got mounted and where;

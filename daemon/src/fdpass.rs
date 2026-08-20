@@ -26,6 +26,26 @@ pub fn socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     unsafe { Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
 }
 
+/// A pipe, used only to tell a waiting thread to stop: closing the write
+/// end makes the read end readable, which is the whole signal.
+pub fn stop_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc == -1 {
+        return last_error();
+    }
+    unsafe { Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
+}
+
+/// One `read`, reported as it happened: `Ok(0)` means the far end is gone.
+pub fn read_byte(fd: BorrowedFd<'_>, buf: &mut [u8; 1]) -> io::Result<usize> {
+    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
+    if n < 0 {
+        return last_error();
+    }
+    Ok(n as usize)
+}
+
 /// Bound how long a receive may block, so a helper that never answers
 /// cannot wedge the daemon.
 pub fn set_receive_timeout(sock: BorrowedFd<'_>, timeout: Duration) -> io::Result<()> {
