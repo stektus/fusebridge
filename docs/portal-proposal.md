@@ -297,6 +297,35 @@ bug: a crashed filesystem elsewhere in the session, appearing during a request,
 matched everything the service then looked at — including, on this machine, a
 crashed `xdg-document-portal` mount.
 
+### 6.3 Upstream found the same thing, and has fixed half of it
+
+After measuring the above I went looking through libfuse master, and the
+maintainer had got there independently. Commit `bad8b22c9` (11 June 2026)
+describes the same attack from the other side, with a worse ending than mine:
+
+> validate an attacker-owned directory, swap a parent component to a symlink
+> into `/etc`, then signal — the mount lands on a root-owned directory,
+> defeating `check_nonroot_dir_access()`. With `user_allow_other` this yields
+> local root via a fake sudoers drop-in.
+
+The fix is exactly the shape section 8 used to ask for: pin the validated
+inode as a single descriptor, `move_mount()` onto it with
+`MOVE_MOUNT_T_EMPTY_PATH` so no path is re-resolved, and assert at the mount
+site that `fstat` still matches what validation saw.
+
+Two things keep it from settling the question here. It applies to the
+`--sync-init` path only — the commit says plainly that "the legacy `mount()`
+path and the library direct-mount path are unchanged (`mnt_fd == -1` keeps
+path resolution)", and the legacy path is the one every FUSE library in the
+field uses and the one a portal sits on. And it is unreleased: the latest
+release, 3.18.2, is from 18 March 2026, three months before the fix.
+
+So the withholding invariant is what carries the weight today, and will keep
+carrying it for as long as any unfixed `fusermount3` is installed — which,
+given how distributions ship libfuse, is years. What changes is section 8:
+the ask is no longer for a mechanism, it is for the mechanism that exists to
+cover the path everyone actually takes.
+
 ### 6.2 Three more bugs that only appeared on other people's systems
 
 All three were invisible on the development machine and were found by running
@@ -382,28 +411,35 @@ is the socket.
 
 ## 8. One concrete request upstream, to libfuse
 
-**`fusermount3` should be able to mount on a directory descriptor it is given,
-without resolving a path.**
+**The pinned-mountpoint treatment in `bad8b22c9` should cover the path FUSE
+libraries actually take, not only `--sync-init`.**
 
-Everything in section 6 is a workaround for the second resolution. With a
-`fusermount3` that accepts an already-open directory fd — inherited across
-`exec`, named by number, say `fusermount3 --mountpoint-fd=N` — the check and
-the mount would describe the same inode, the race would not exist, and a
-portal would need neither the descriptor-withholding machinery nor the revert
-path. The interface could then be honest about it and take a directory
-descriptor from the caller as well.
+Everything in section 6 is a workaround for the second path resolution, and
+6.3 is the news that upstream has already built the cure and pointed it at a
+different patient. `mount_context.mnt_fd`, `move_mount()` with
+`MOVE_MOUNT_T_EMPTY_PATH`, and the `fstat` assertion at the mount site are
+in the tree. What is not covered is the `_FUSE_COMMFD` path — the one libfuse
+itself falls back to when the privileged mount returns EPERM, which is the
+only path available to an unprivileged or sandboxed process, and the one this
+proposal is built on.
 
-Concretely, `fuse_mnt_resolve_path` and the `chdir` after it are what would
-be skipped; the attach itself can address the descriptor directly with
-`move_mount(mfd, "", dirfd, "", MOVE_MOUNT_F_EMPTY_PATH)` on a kernel new
-enough for the new mount API, and `fchdir(dirfd)` followed by mounting on
-`"."` — never re-deriving a path from the argument — on one that is not. The
-setuid check that matters (`is this directory the caller's to mount on`) is
-the same either way, and reads the descriptor rather than a name.
+Measured against the released 3.18.2, that path is not theoretical: **20
+escapes in 120 attempts** from a service that validated the mountpoint before
+invoking the helper, and 4 in 120 after pinning the directory and passing
+`fchdir` + `.`, because the argument is turned back into a path regardless.
 
-This is a small change in a well-defined place, and the portal work does not
-depend on it: the design above works without it, at the cost of a short-lived
-dead mount and a good deal of complexity that exists only to detect one.
+Where the new mount API is unavailable — the code is guarded by
+`HAVE_NEW_MOUNT_API`, and 3.18.2 is what distributions ship — `fchdir(dirfd)`
+and mounting on `"."` without re-deriving a path from the argument is the
+same idea at lower cost. Either way, the permission check that matters (is
+this directory the caller's to mount on) reads a descriptor rather than a
+name.
+
+The portal work does not depend on it: the design above works without it, at
+the cost of a short-lived dead mount and a good deal of complexity that
+exists only to detect one. But every unfixed `fusermount3` in the field is a
+reason for a portal to keep that complexity, and a released fix is what would
+eventually let a portal drop it.
 
 ## 9. What the reference implementation demonstrates
 
@@ -458,6 +494,14 @@ documentation will need to state:
   | `-o <opts> -- <mp>` | mounting |
   | `--unmount --quiet --lazy -- <mp>` | unmounting, **after the app's own `umount2()` fails** — i.e. exactly in a sandbox |
   | `--auto-unmount -- <mp>` | watchdog, after a direct `mount(2)` succeeded |
+  | `--sync-init -o <opts> -- <mp>` | **master only, not yet released**: the new mount API's unprivileged fallback, with a *second* socket in `_FUSE_COMMFD2` and a signalling step |
+
+  The fifth form is the one to plan for rather than the one to handle today:
+  it is reached when the privileged mount returns EPERM, which is the sandbox
+  case, and it is built by default (`-Dsync-init=auto`). Anything standing in
+  for `fusermount3` will need it once that ships, and it is a genuinely
+  different protocol — bidirectional, with the caller signalling the helper
+  to proceed — rather than another spelling of the same one.
 
   The unmount form uses long options that do not appear in `fusermount3
   --help`. A shim that does not parse them takes `--unmount` for a mountpoint,
