@@ -64,9 +64,20 @@ pub fn parse(content: &str) -> Vec<MountEntry> {
     entries
 }
 
+/// Read the mount table.
+///
+/// The kernel builds this file as it is read, a page of records at a time,
+/// so it takes several reads and mounts coming and going elsewhere in the
+/// session can leave a reading without an entry that was there throughout.
+/// Callers must therefore treat a single "not there" as a maybe: see how
+/// `sweep_stale` asks twice before forgetting a mount it is responsible for.
+fn read_table() -> std::io::Result<String> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+}
+
 /// Every FUSE mount in the live mount table.
 pub fn fuse_mounts() -> std::io::Result<Vec<MountEntry>> {
-    let content = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let content = read_table()?;
     Ok(parse(&content)
         .into_iter()
         .filter(|e| e.fstype.starts_with("fuse"))
@@ -93,7 +104,7 @@ pub fn fuse_connections() -> std::io::Result<std::collections::HashSet<String>> 
 /// Read the live mountinfo and find the entry for `mount_point`, if any.
 /// If several entries stack on the same path, the last (topmost) wins.
 pub fn find(mount_point: &Path) -> std::io::Result<Option<MountEntry>> {
-    let content = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let content = read_table()?;
     Ok(parse(&content)
         .into_iter()
         .rfind(|e| e.mount_point == mount_point))

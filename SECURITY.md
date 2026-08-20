@@ -79,7 +79,10 @@ happens outside, and the `/dev/fuse` descriptor is passed back in.
 | Unmount another application's filesystem | Only mounts this daemon made, and only for the app that made them | `refuses_to_unmount_a_mount_it_did_not_create`, `unmount_is_restricted_to_the_owning_app`, plus a live cross-app run (see below) |
 | Fill the session's mount table | A ceiling on live mounts (`--max-mounts`, 64 by default) | `enforces_the_mount_limit` |
 | Freeze the daemon for everyone | Mountpoint resolution runs on its own thread with a deadline; abandoned checks are counted and capped | `an_unresponsive_filesystem_cannot_wedge_the_daemon` |
+| Make other applications wait | Every request is served on its own worker; mountpoints are claimed so two requests cannot race for one | `a_stuck_request_does_not_hold_up_another_application`, `several_applications_can_mount_at_once` |
 | Impersonate another app by pid reuse | `/proc/<pid>` is opened once and everything is read through that handle | `dead_pid_is_an_error_not_an_identity` |
+| Have the daemon unmount somebody else's filesystem | A mount is removed only if it went from connected to disconnected exactly when the daemon dropped its descriptor | `only_a_mount_that_died_with_our_descriptor_is_ours`, `a_stranger_s_filesystem_is_never_unmounted` |
+| Be handed a mount option that quietly does nothing | `auto_unmount` is refused, because the bridge holds the socket the helper watches | `refuses_auto_unmount_rather_than_pretending` |
 
 The tests live in [daemon/tests/attacks.rs](daemon/tests/attacks.rs) and
 `daemon/src/*.rs`; `cargo test` runs them against a real daemon on a private
@@ -107,12 +110,22 @@ nothing to anyone, and is then removed. The attack degrades from "shadow
 `~/.ssh` with a filesystem you control" to "make a directory answer ENOTCONN
 for a moment".
 
-Recognising which mount to remove takes three facts together, because the
-mount table belongs to the whole session: it did not exist when the
-operation started, its FUSE connection appeared while the helper ran
-(connection numbers are reused after an abort, so the number alone proves
-nothing), and it died exactly when the daemon dropped the descriptor.
-Anything else is somebody else's filesystem and is left alone.
+Recognising which mount to remove is the delicate part, because the mount
+table belongs to the whole session and other programs mount and crash
+whenever they like. Two facts narrow the field — the mount did not exist
+when the operation started, and its FUSE connection appeared while the
+helper ran (connection numbers are reused after an abort, so the number
+alone proves nothing) — and one decides: while the daemon holds the
+descriptor its own mount is connected, and letting go disconnects that mount
+and nothing else in the session. So the mount that *changed* is the
+daemon's. A filesystem somebody is serving answers throughout; one that was
+already disconnected belongs to some other program whose server died on its
+own, and deciding when that should be cleaned up is not this daemon's
+business. Both are left alone.
+
+That last distinction was not there at first, and its absence was a bug: a
+crashed filesystem elsewhere in the session, appearing during a request,
+matched everything the daemon then looked at.
 
 Residual risk: the misplaced mount exists, dead, for the few milliseconds
 between the mount and its removal. Closing that properly needs
@@ -140,14 +153,17 @@ upstream, and one of the concrete proposals this project carries to
 
 ## Known limits
 
-- **The daemon serves one request at a time.** Resolution has a deadline, so
-  it can no longer be wedged for good, but a mount request can still hold it
-  for around twenty seconds in the worst case. That is a denial of service
-  one application can inflict on another. A worker per request is the fix
-  and has not been done.
 - **A misplaced mount exists briefly**, as described above.
-- **`auto_unmount` is implemented but not exercised** by any test or live
-  run.
+- **`auto_unmount` is refused, not supported.** The option asks the helper to
+  unmount when the application dies, which it detects by the `_FUSE_COMMFD`
+  socket closing. The bridge holds that socket, so the signal never arrives.
+  Supporting it would mean the daemon watching the application's own socket
+  for end-of-file and unmounting then — worth doing, not done.
+- **Forgetting a mount is possible in principle.** The kernel builds
+  `/proc/self/mountinfo` as it is read, so a reading taken while the session
+  is mounting and unmounting can come back without an entry that was there
+  throughout. A record is only dropped after two readings agree it is gone,
+  and never because the read failed — but two readings are not a proof.
 - **Mount options other than the refused ones are passed through** to
   `fusermount3` as the application gave them. The daemon does not attempt to
   understand them.

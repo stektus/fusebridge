@@ -12,10 +12,12 @@ the shim — with the mount visible to the whole host. Every policy rule is
 exercised by the test suite against a real daemon making real mounts,
 including the mountpoint-shadowing race; the threat model is written down in
 [SECURITY.md](SECURITY.md). `make install` sets up D-Bus activation, verified
-by watching the daemon start on the first call. The zero-install fallback
-(layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME (gvfs/SFTP).
-Not yet done: the written spec for the portal issue, and a worker per request
-so one application cannot make others wait.
+by watching the daemon start on the first call. Requests are served
+concurrently, so no application can make another wait on it. The zero-install
+fallback (layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME
+(gvfs/SFTP). Not yet done: the written spec for the portal issue, and
+support for `auto_unmount`, which is refused for now rather than silently
+ignored.
 
 ## The problem
 
@@ -82,6 +84,10 @@ Policy enforced by the daemon, one journal line per operation:
 - `allow_other`/`allow_root` options are refused;
 - a ceiling on live mounts (`--max-mounts`, 64 by default) keeps one app from
   filling the session's mount table;
+- `auto_unmount` is refused rather than quietly ignored: the bridge holds the
+  socket the helper watches for it, so the mount would outlive the app;
+- every request is served on its own worker, so one application waiting on a
+  filesystem that never answers does not keep the others waiting;
 - after the mount the daemon re-checks what actually got mounted and where;
   anything unexpected is immediately unmounted;
 - unmount is possible only for mounts created through the daemon, and only

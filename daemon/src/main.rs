@@ -31,7 +31,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
@@ -50,6 +50,10 @@ const DEFAULT_MAX_MOUNTS: usize = 64;
 const FD_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to spend resolving a mountpoint before giving up on it.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for a mount to say whether it is still connected. A
+/// mount that has been abandoned answers at once; one that is still alive
+/// but unserved never answers, and is not ours to touch anyway.
+const LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
 /// Attempts to remove a mount that must not stay, and the pause between them.
 const REVERT_ATTEMPTS: usize = 40;
 const REVERT_PAUSE: Duration = Duration::from_millis(50);
@@ -58,12 +62,12 @@ struct MountRecord {
     app_id: String,
     fstype: String,
     source: String,
-    /// The fusermount3 child. With -o auto_unmount it stays alive holding
-    /// the comm socket; kept here so its stderr pipe is not closed under it
-    /// and so the zombie is reaped on unmount.
+    /// The fusermount3 child, kept so its zombie is reaped on unmount and so
+    /// its stderr pipe is not closed under it if it is still running.
     child: Child,
-    /// The daemon's end of that socket. With -o auto_unmount fusermount3
-    /// waits for it to close, so it must outlive the mount.
+    /// The daemon's end of the socket fusermount3 reported on. Kept for the
+    /// life of the mount: a helper that is still watching it must not see it
+    /// close early.
     _comm: OwnedFd,
 }
 
@@ -72,29 +76,61 @@ struct Caller {
     app_id: String,
 }
 
-struct Bridge {
+/// What the daemon knows about mounts: the ones it made, and the mountpoints
+/// it is in the middle of making. Requests run on worker threads, so both
+/// have to be decided together, under one lock.
+#[derive(Default)]
+struct Registry {
+    mounts: HashMap<PathBuf, MountRecord>,
+    in_progress: HashSet<PathBuf>,
+}
+
+struct State {
     allowed_roots: Vec<PathBuf>,
     allow_unsandboxed: bool,
     max_mounts: usize,
     /// Separate bus connection for credential lookups: calling back into the
     /// serving connection from a handler would deadlock the blocking API.
     creds: zbus::blocking::fdo::DBusProxy<'static>,
-    mounts: Mutex<HashMap<PathBuf, MountRecord>>,
+    registry: Mutex<Registry>,
 }
 
-impl Bridge {
+/// The D-Bus face of the daemon.
+///
+/// Each call is handed to a worker thread. The work is blocking by nature —
+/// resolving a path, running a helper, waiting for a mount to appear — and
+/// doing it on the connection's own thread would mean one application's
+/// mount keeps every other application waiting.
+struct Bridge {
+    state: Arc<State>,
+}
+
+/// Releases a reserved mountpoint however the request ends.
+struct Reservation {
+    state: Arc<State>,
+    path: PathBuf,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.state
+            .registry
+            .lock()
+            .unwrap()
+            .in_progress
+            .remove(&self.path);
+    }
+}
+
+impl State {
     /// Resolve and authorize the D-Bus caller. Only same-uid processes are
     /// accepted; Flatpak identity is required unless --allow-unsandboxed.
-    fn identify_caller(
-        &self,
-        header: &zbus::message::Header<'_>,
-    ) -> Result<Caller, zbus::fdo::Error> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::AccessDenied("no sender on message".into()))?;
+    fn identify_caller(&self, sender: &str) -> Result<Caller, zbus::fdo::Error> {
+        let sender = zbus::names::BusName::try_from(sender)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("unusable sender name: {e}")))?;
         let creds = self
             .creds
-            .get_connection_credentials(zbus::names::BusName::from(sender.to_owned()))
+            .get_connection_credentials(sender)
             .map_err(|e| zbus::fdo::Error::Failed(format!("cannot get caller credentials: {e}")))?;
         let pid = creds
             .process_id()
@@ -124,19 +160,29 @@ impl Bridge {
 
     /// Drop state records whose mounts no longer exist (e.g. the FUSE
     /// process died and the kernel cleaned up, or auto_unmount fired).
+    ///
+    /// Forgetting a mount costs the ability to unmount it later, so a record
+    /// is never dropped merely because the mount table could not be read,
+    /// and only when the mount is missing from two separate readings.
     fn sweep_stale(&self, mounts: &mut HashMap<PathBuf, MountRecord>) {
-        mounts.retain(|mp, rec| match mountinfo::find(mp) {
-            Ok(Some(_)) => true,
-            _ => {
+        let missing: Vec<PathBuf> = mounts
+            .keys()
+            .filter(|mp| matches!(mountinfo::find(mp), Ok(None)))
+            .cloned()
+            .collect();
+        for mp in missing {
+            if !matches!(mountinfo::find(&mp), Ok(None)) {
+                continue;
+            }
+            if let Some(mut rec) = mounts.remove(&mp) {
                 let _ = rec.child.try_wait();
                 info!(
                     "sweep: mount at '{}' (app {}) is gone, dropping record",
                     mp.display(),
                     rec.app_id
                 );
-                false
             }
-        });
+        }
     }
 
     /// Remove a mount the daemon decided must not stay. Unmounting names a
@@ -162,67 +208,117 @@ impl Bridge {
         matches!(mountinfo::find(path), Ok(None))
     }
 
-    /// Remove the mount this operation caused if it did not land on the
-    /// approved directory.
+    /// Everything that could be the mount this operation caused, going the
+    /// wrong way: new since the operation started, on a FUSE connection that
+    /// appeared while the helper ran, and not the approved directory.
     ///
-    /// A candidate has to pass three tests, because the mount table belongs
-    /// to the whole session and something else may mount at any moment. It
-    /// must not have existed before this operation started (`before`); its
-    /// connection must have appeared while the helper ran (`ours`) — the
-    /// kernel reuses connection numbers after an abort, which is why the
-    /// number alone proves nothing; and it must have died when the daemon
-    /// dropped the descriptor a moment ago, since a filesystem somebody else
-    /// is serving answers normally and is left alone.
-    fn revert_misplaced(
+    /// Neither test is proof on its own. The mount table belongs to the whole
+    /// session, anything may mount at any moment, and the kernel reuses
+    /// connection numbers after an abort. This narrows the field; `we_made`
+    /// decides.
+    fn misplaced_candidates(
         &self,
         before: &HashSet<String>,
         ours: &HashSet<String>,
         approved: &Path,
     ) -> Vec<PathBuf> {
-        let mut left_behind = Vec::new();
-        for entry in mountinfo::fuse_mounts().unwrap_or_default() {
-            if entry.mount_point == approved
-                || before.contains(&entry.id)
-                || !ours.contains(&entry.dev)
-            {
-                continue;
-            }
-            match std::fs::metadata(&entry.mount_point) {
-                Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {}
-                _ => {
-                    warn!(
-                        "a live FUSE mount at '{}' shares a connection number with this \
-                         operation but is not ours; leaving it alone",
-                        entry.mount_point.display()
-                    );
-                    continue;
+        mountinfo::fuse_mounts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                entry.mount_point != approved
+                    && !before.contains(&entry.id)
+                    && ours.contains(&entry.dev)
+            })
+            .map(|entry| entry.mount_point)
+            .collect()
+    }
+
+    /// Of those candidates, the ones this daemon actually made.
+    ///
+    /// The proof is what dropping the descriptor did to them. While the
+    /// daemon holds it, its own mount is connected, whoever is or is not
+    /// serving it; letting go disconnects it. Nothing else in the session
+    /// changes at that instant. So the mount that went from connected to
+    /// disconnected is ours, and everything else is somebody's business we
+    /// have none of:
+    ///
+    /// * a filesystem being served answers throughout — a document portal or
+    ///   an archive mount that happened to start while we worked;
+    /// * a filesystem that was *already* disconnected stays that way — some
+    ///   other program's mount whose server died on its own. Removing that
+    ///   would be tidying up after a stranger, and this daemon has no
+    ///   business deciding when a stranger's mount should go.
+    ///
+    /// `before` must be gathered while the descriptor is still held.
+    fn we_made(
+        &self,
+        candidates: &[PathBuf],
+        before: &HashMap<PathBuf, policy::Liveness>,
+    ) -> Vec<PathBuf> {
+        candidates
+            .iter()
+            .filter(|path| {
+                let was = before
+                    .get(*path)
+                    .copied()
+                    .unwrap_or(policy::Liveness::Silent);
+                let now = policy::liveness_within(path, LIVENESS_TIMEOUT);
+                if policy::is_ours(was, now) {
+                    return true;
                 }
-            }
+                warn!(
+                    "a FUSE mount at '{}' appeared during this operation but went from {was:?} \
+                     to {now:?}, so it is not ours; leaving it alone",
+                    path.display()
+                );
+                false
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// What each of these mounts has to say for itself right now.
+    fn liveness_of(&self, candidates: &[PathBuf]) -> HashMap<PathBuf, policy::Liveness> {
+        candidates
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    policy::liveness_within(path, LIVENESS_TIMEOUT),
+                )
+            })
+            .collect()
+    }
+
+    /// Remove mounts this operation made that did not land where they should.
+    fn remove_misplaced(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut left_behind = Vec::new();
+        for path in paths {
             error!(
                 "removing a mount that landed outside the approved directory: '{}'",
-                entry.mount_point.display()
+                path.display()
             );
-            if !self.force_unmount(&entry.mount_point) {
-                left_behind.push(entry.mount_point);
+            if !self.force_unmount(path) {
+                left_behind.push(path.clone());
             }
         }
         left_behind
     }
 }
 
-#[interface(name = "io.github.stektus.FuseBridge1")]
-impl Bridge {
+impl State {
     /// Perform a FUSE mount. `comm_fd` is the _FUSE_COMMFD unix socket of
     /// the in-sandbox FUSE library; the host fusermount3 sends the /dev/fuse
     /// fd back over it, so the filesystem daemon never leaves the sandbox.
     fn mount(
-        &self,
+        self: &Arc<Self>,
         options: Vec<String>,
         mountpoint: String,
         comm_fd: zbus::zvariant::OwnedFd,
-        #[zbus(header)] header: zbus::message::Header<'_>,
+        sender: String,
     ) -> zbus::fdo::Result<()> {
-        let caller = self.identify_caller(&header)?;
+        let caller = self.identify_caller(&sender)?;
         let deny = |reason: String| {
             warn!(
                 "DENY mount app={} pid={} mountpoint='{}': {}",
@@ -233,15 +329,8 @@ impl Bridge {
 
         policy::check_options(&options).map_err(&deny)?;
 
-        let mut mounts = self.mounts.lock().unwrap();
-        self.sweep_stale(&mut mounts);
-        if mounts.len() >= self.max_mounts {
-            return Err(deny(format!(
-                "the limit of {} live mounts is reached",
-                self.max_mounts
-            )));
-        }
-
+        // Resolving comes before the lock: it can take a while, and holding
+        // the registry meanwhile would make every other request wait.
         // From here on the mountpoint is held open: the descriptor, not the
         // path, is what gets mounted on.
         let approved =
@@ -249,12 +338,32 @@ impl Bridge {
                 .map_err(&deny)?;
         let mp = approved.path.clone();
 
-        if mounts.contains_key(&mp) {
-            return Err(deny(format!(
-                "'{}' is already mounted via this daemon",
-                mp.display()
-            )));
-        }
+        // Claim the mountpoint. Two requests naming the same directory must
+        // not both proceed, and the ceiling counts work in flight too.
+        let _reservation = {
+            let mut registry = self.registry.lock().unwrap();
+            self.sweep_stale(&mut registry.mounts);
+            if registry.mounts.len() + registry.in_progress.len() >= self.max_mounts {
+                return Err(deny(format!(
+                    "the limit of {} live mounts is reached",
+                    self.max_mounts
+                )));
+            }
+            if registry.mounts.contains_key(&mp) {
+                return Err(deny(format!(
+                    "'{}' is already mounted via this daemon",
+                    mp.display()
+                )));
+            }
+            if !registry.in_progress.insert(mp.clone()) {
+                return Err(deny(format!("'{}' is already being mounted", mp.display())));
+            }
+            Reservation {
+                state: Arc::clone(self),
+                path: mp.clone(),
+            }
+        };
+
         if mountinfo::find(&mp)
             .map_err(|e| zbus::fdo::Error::Failed(format!("cannot read mountinfo: {e}")))?
             .is_some()
@@ -366,10 +475,24 @@ impl Bridge {
             && fuse_fd.is_some();
 
         if !verified {
-            // Order matters: close the descriptor first so the strays can be
-            // recognised as ours and are already dead when they are removed.
-            drop(fuse_fd);
-            let stuck = self.revert_misplaced(&mounts_before, &new_connections, &mp);
+            // Only go looking for a misplaced mount when nothing appeared at
+            // the approved path. If the mount is there and the request failed
+            // for some other reason, no mount went astray, and anything else
+            // new in the table belongs to somebody else.
+            let stuck = if entry.is_none() {
+                // Ask who is answering while the descriptor is still held:
+                // that is what tells this operation's mount apart from a
+                // filesystem somebody else happens to be starting.
+                let candidates = self.misplaced_candidates(&mounts_before, &new_connections, &mp);
+                let before_drop = self.liveness_of(&candidates);
+                drop(fuse_fd);
+                let ours = self.we_made(&candidates, &before_drop);
+                self.remove_misplaced(&ours)
+            } else {
+                drop(fuse_fd);
+                self.force_unmount(&mp);
+                Vec::new()
+            };
             let _ = child.kill();
             let _ = child.wait();
 
@@ -437,7 +560,7 @@ impl Bridge {
             entry.fstype,
             entry.source
         );
-        mounts.insert(
+        self.registry.lock().unwrap().mounts.insert(
             mp,
             MountRecord {
                 app_id: caller.app_id,
@@ -452,13 +575,8 @@ impl Bridge {
 
     /// Unmount a mount previously created through this daemon, by the same
     /// application that created it.
-    fn unmount(
-        &self,
-        mountpoint: String,
-        lazy: bool,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> zbus::fdo::Result<()> {
-        let caller = self.identify_caller(&header)?;
+    fn unmount(&self, mountpoint: String, lazy: bool, sender: String) -> zbus::fdo::Result<()> {
+        let caller = self.identify_caller(&sender)?;
 
         // A dead FUSE endpoint may not canonicalize; fall back to the raw
         // path if it matches a record exactly.
@@ -470,7 +588,8 @@ impl Bridge {
             )));
         }
 
-        let mut mounts = self.mounts.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let mounts = &mut registry.mounts;
         let Some(record) = mounts.get(&mp) else {
             warn!(
                 "DENY unmount app={} pid={} mountpoint='{}': not a mount of this daemon",
@@ -552,8 +671,9 @@ impl Bridge {
 
     /// List active mounts as (mountpoint, app_id, fstype, source).
     fn list_mounts(&self) -> Vec<(String, String, String, String)> {
-        let mut mounts = self.mounts.lock().unwrap();
-        self.sweep_stale(&mut mounts);
+        let mut registry = self.registry.lock().unwrap();
+        let Registry { mounts, .. } = &mut *registry;
+        self.sweep_stale(mounts);
         mounts
             .iter()
             .map(|(mp, r)| {
@@ -565,6 +685,46 @@ impl Bridge {
                 )
             })
             .collect()
+    }
+}
+
+/// The name of the connection a message came from, which is what the caller
+/// is identified by.
+fn sender_of(header: &zbus::message::Header<'_>) -> zbus::fdo::Result<String> {
+    header
+        .sender()
+        .map(|s| s.to_string())
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied("no sender on message".into()))
+}
+
+#[interface(name = "io.github.stektus.FuseBridge1")]
+impl Bridge {
+    async fn mount(
+        &self,
+        options: Vec<String>,
+        mountpoint: String,
+        comm_fd: zbus::zvariant::OwnedFd,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let sender = sender_of(&header)?;
+        let state = Arc::clone(&self.state);
+        blocking::unblock(move || state.mount(options, mountpoint, comm_fd, sender)).await
+    }
+
+    async fn unmount(
+        &self,
+        mountpoint: String,
+        lazy: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let sender = sender_of(&header)?;
+        let state = Arc::clone(&self.state);
+        blocking::unblock(move || state.unmount(mountpoint, lazy, sender)).await
+    }
+
+    async fn list_mounts(&self) -> Vec<(String, String, String, String)> {
+        let state = Arc::clone(&self.state);
+        blocking::unblock(move || state.list_mounts()).await
     }
 
     #[zbus(property)]
@@ -668,11 +828,13 @@ fn main() {
     });
 
     let bridge = Bridge {
-        allowed_roots,
-        allow_unsandboxed,
-        max_mounts,
-        creds,
-        mounts: Mutex::new(HashMap::new()),
+        state: Arc::new(State {
+            allowed_roots,
+            allow_unsandboxed,
+            max_mounts,
+            creds,
+            registry: Mutex::new(Registry::default()),
+        }),
     };
 
     let _conn = zbus::blocking::connection::Builder::session()

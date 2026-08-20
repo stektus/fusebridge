@@ -36,11 +36,33 @@ const MAX_STUCK_CHECKS: usize = 32;
 /// would expose the sandboxed filesystem to other users of the machine.
 const FORBIDDEN_OPTIONS: &[&str] = &["allow_other", "allow_root"];
 
+/// Options the daemon cannot honour, and will not pretend to.
+///
+/// `auto_unmount` works by `fusermount3` outliving the mount and watching
+/// the `_FUSE_COMMFD` socket: it unmounts when that socket closes. Observed
+/// directly — asked for `auto_unmount`, the helper never exited, and it is
+/// how the session's own document portal keeps its mount.
+///
+/// Through the bridge that socket belongs to the daemon, not to the
+/// application: taking it is what lets a misplaced mount be caught before
+/// anyone can use it. So the socket now closes when the *daemon* is done
+/// with the mount, and the application's death — the event the option
+/// exists for — never reaches the helper. Refusing says so plainly;
+/// accepting would be a promise of cleanup that never comes.
+const UNSUPPORTED_OPTIONS: &[(&str, &str)] = &[(
+    "auto_unmount",
+    "the bridge holds the descriptor the helper watches, so the mount would \
+     outlive the application instead of being cleaned up; unmount explicitly",
+)];
+
 pub fn check_options(options: &[String]) -> Result<(), String> {
     for opt in options {
         let key = opt.split('=').next().unwrap_or(opt);
         if FORBIDDEN_OPTIONS.contains(&key) {
             return Err(format!("mount option '{key}' is not allowed"));
+        }
+        if let Some((_, why)) = UNSUPPORTED_OPTIONS.iter().find(|(name, _)| *name == key) {
+            return Err(format!("mount option '{key}' is not supported: {why}"));
         }
         if opt.contains(',') {
             return Err(format!("malformed mount option '{opt}'"));
@@ -103,6 +125,49 @@ pub fn check_mountpoint_within(
             timeout.as_secs()
         ))
     })
+}
+
+/// What a mount has to say for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// Somebody is serving it: it answered.
+    Answering,
+    /// Its `/dev/fuse` descriptor is gone; every request fails at once.
+    Disconnected,
+    /// Nobody answered in time. A mount whose server has gone away without
+    /// the connection being closed behaves like this, and so does one that
+    /// is merely slow.
+    Silent,
+}
+
+/// Whether a mount is one the daemon just made, judged by what letting go of
+/// the `/dev/fuse` descriptor did to it.
+///
+/// While the daemon holds that descriptor its own mount is connected —
+/// whether or not anyone is serving it yet — and dropping it disconnects
+/// that mount and nothing else in the session. So the one that changed is
+/// the daemon's. A mount that was *already* disconnected belongs to some
+/// other program whose server died on its own, and deciding when that should
+/// be cleaned up is not this daemon's business.
+pub fn is_ours(before: Liveness, after: Liveness) -> bool {
+    before != Liveness::Disconnected && after == Liveness::Disconnected
+}
+
+/// Ask a mount whether it is still connected, without being able to hang on
+/// the answer: a mount with no one serving it never replies at all.
+pub fn liveness_within(path: &Path, timeout: Duration) -> Liveness {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = path.to_path_buf();
+    STUCK_CHECKS.fetch_add(1, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let answer = match std::fs::metadata(&owned) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => Liveness::Disconnected,
+            _ => Liveness::Answering,
+        };
+        STUCK_CHECKS.fetch_sub(1, Ordering::Relaxed);
+        let _ = sender.send(answer);
+    });
+    receiver.recv_timeout(timeout).unwrap_or(Liveness::Silent)
 }
 
 /// Validate a mountpoint request, returning it pinned by a descriptor.
@@ -194,6 +259,13 @@ mod tests {
     }
 
     #[test]
+    fn refuses_auto_unmount_rather_than_pretending() {
+        let err = check_options(&["auto_unmount".into()]).unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+        assert!(err.contains("unmount explicitly"), "{err}");
+    }
+
+    #[test]
     fn mountpoint_must_be_inside_root_not_the_root() {
         let tmp = tmpdir("inside");
         let root = tmp.join("root");
@@ -277,5 +349,27 @@ mod tests {
     fn unmount_is_restricted_to_the_owning_app() {
         assert!(may_unmount("org.example.App", "org.example.App"));
         assert!(!may_unmount("org.example.App", "org.evil.Other"));
+    }
+
+    #[test]
+    fn only_a_mount_that_died_with_our_descriptor_is_ours() {
+        use Liveness::*;
+
+        // Nobody was serving it, and letting go of the descriptor killed it.
+        assert!(is_ours(Silent, Disconnected));
+        // Something was answering on it and it died with our descriptor: also
+        // ours, once the application had started serving.
+        assert!(is_ours(Answering, Disconnected));
+
+        // Already dead before we let go: somebody else's crashed filesystem,
+        // and tidying it away is not this daemon's decision to make.
+        assert!(!is_ours(Disconnected, Disconnected));
+        // Unaffected by us, so not ours, whatever it is doing.
+        assert!(!is_ours(Answering, Answering));
+        assert!(!is_ours(Silent, Silent));
+        assert!(!is_ours(Silent, Answering));
+        assert!(!is_ours(Answering, Silent));
+        assert!(!is_ours(Disconnected, Answering));
+        assert!(!is_ours(Disconnected, Silent));
     }
 }

@@ -9,7 +9,7 @@
 //! walks into it.
 
 use std::io::{BufRead, BufReader};
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -481,10 +481,19 @@ fn enforces_the_mount_limit() {
     assert!(err.contains("limit of 2 live mounts"), "{err}");
     assert!(!is_mounted(&c));
 
-    fx.unmount(&a).unwrap();
-    fx.mount(&c, &[]).expect("a freed slot must be reusable");
-    fx.unmount(&b).unwrap();
-    fx.unmount(&c).unwrap();
+    fx.unmount(&a)
+        .unwrap_or_else(|e| panic!("unmount a: {e}\ndaemon journal:\n{}", fx.journal()));
+    fx.mount(&c, &[])
+        .unwrap_or_else(|e| panic!("a freed slot must be reusable: {e}"));
+    fx.unmount(&b).unwrap_or_else(|e| {
+        panic!(
+            "unmount b: {e}\nstill mounted: {}\ndaemon journal:\n{}",
+            is_mounted(&b),
+            fx.journal()
+        )
+    });
+    fx.unmount(&c)
+        .unwrap_or_else(|e| panic!("unmount c: {e}\ndaemon journal:\n{}", fx.journal()));
 }
 
 /// Atomically swap two directory entries, whatever their types.
@@ -655,6 +664,160 @@ fn an_unresponsive_filesystem_cannot_wedge_the_daemon() {
     // Still serving everyone else.
     fx.mount(&after, &[]).expect("the daemon must still work");
     assert!(is_mounted(&after));
+}
+
+/// One application waiting on a filesystem that will never answer must not
+/// be able to keep another application waiting with it.
+#[test]
+fn a_stuck_request_does_not_hold_up_another_application() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("parallel");
+    let hung = fx.mkdir("hung");
+    let quick = fx.mkdir("quick");
+    fx.mount(&hung, &[]).expect("the bait must mount");
+
+    let bait = hung.join("inside");
+    std::thread::scope(|scope| {
+        let stuck = scope.spawn(|| fx.mount(&bait, &[]));
+        // Let the first request get well into its wait before asking.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        fx.mount(&quick, &[])
+            .expect("the second application must be served");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(3),
+            "waited {waited:?} to be served while another request was stuck"
+        );
+        assert!(is_mounted(&quick));
+
+        let _ = stuck.join();
+    });
+}
+
+#[test]
+fn several_applications_can_mount_at_once() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("concurrent");
+    let dirs: Vec<PathBuf> = (0..4).map(|i| fx.mkdir(&format!("d{i}"))).collect();
+
+    let fx = &fx;
+    std::thread::scope(|scope| {
+        let attempts: Vec<_> = dirs
+            .iter()
+            .map(|dir| scope.spawn(move || fx.mount(dir, &[])))
+            .collect();
+        for attempt in attempts {
+            attempt
+                .join()
+                .expect("no thread may panic")
+                .expect("every mount must succeed");
+        }
+    });
+
+    for dir in &dirs {
+        assert!(is_mounted(dir), "{} is not mounted", dir.display());
+    }
+    let listed: Vec<(String, String, String, String)> = fx
+        .proxy()
+        .call("ListMounts", &())
+        .expect("ListMounts must work");
+    assert_eq!(listed.len(), dirs.len(), "every mount must be recorded");
+}
+
+/// The mount table belongs to the whole session, and other programs mount
+/// things whenever they like — including filesystems whose server has died,
+/// which look exactly like a mount of ours that went astray. Removing one of
+/// those means tidying up after a stranger, which is not this daemon's
+/// decision to make.
+///
+/// This is a sanity check over the whole path, not a proof: both strangers
+/// here are mounted before the request starts, so the daemon rules them out
+/// early, on the mount ids it saw beforehand. The rule that matters when one
+/// appears *during* a request is pinned by `policy::is_ours` and its unit
+/// tests, which cover every before/after combination.
+#[test]
+fn a_stranger_s_filesystem_is_never_unmounted() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("stranger");
+    // Outside the allowed root, exactly where a misplaced mount would land.
+    let stranger = fx.tmp.join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+
+    // Two strangers: one whose server is attached, and one whose server has
+    // already died — which is what a crashed FUSE filesystem leaves behind,
+    // and what the daemon must resist tidying up on somebody else's behalf.
+    let served = serve_directly(&stranger);
+    let abandoned = fx.tmp.join("abandoned");
+    std::fs::create_dir_all(&abandoned).unwrap();
+    drop(serve_directly(&abandoned));
+    assert!(is_mounted(&stranger));
+    assert!(is_mounted(&abandoned));
+
+    // Now make the daemon fail a mount and go looking for what it caused.
+    let victim = fx.tmp.join("victim");
+    std::fs::create_dir_all(victim.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(&victim, fx.root.join("a")).unwrap();
+    let _ = fx.mount(&fx.root.join("a").join(".ssh"), &[]);
+
+    assert!(
+        is_mounted(&stranger),
+        "the daemon unmounted a filesystem somebody else was serving\ndaemon journal:\n{}",
+        fx.journal()
+    );
+    assert!(
+        is_mounted(&abandoned),
+        "the daemon unmounted a stranger's abandoned filesystem; deciding when \
+         somebody else's mount should go is not its job\ndaemon journal:\n{}",
+        fx.journal()
+    );
+
+    drop(served);
+    for path in [&stranger, &abandoned] {
+        let _ = Command::new(FUSERMOUNT)
+            .args(["-u", "-z", "--"])
+            .arg(path)
+            .status();
+    }
+}
+
+/// A FUSE mount with something actually answering on it: a thread that reads
+/// the requests the kernel sends and replies to none of them would hang, so
+/// this replies to the handshake and then simply keeps the descriptor, which
+/// is enough for the kernel to call the connection live.
+fn serve_directly(dir: &Path) -> OwnedFd {
+    let (ours, theirs) = socketpair();
+    let mut child = unsafe {
+        let mut cmd = Command::new(FUSERMOUNT);
+        cmd.args(["--", "."])
+            .current_dir(dir)
+            .env("_FUSE_COMMFD", theirs.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd.pre_exec(move || {
+            if libc::fcntl(theirs, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        cmd.spawn().expect("cannot run fusermount3")
+    };
+    let _ = child.wait();
+    unsafe { libc::close(theirs) };
+    let fd = recv_fd(ours).expect("the helper must hand over a descriptor");
+    unsafe { libc::close(ours) };
+    // SAFETY: the descriptor was just received and is not owned elsewhere.
+    unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
 /// A mount made without going through the daemon, for the foreign-unmount
