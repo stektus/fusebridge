@@ -57,6 +57,12 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
 /// Attempts to remove a mount that must not stay, and the pause between them.
 const REVERT_ATTEMPTS: usize = 40;
 const REVERT_PAUSE: Duration = Duration::from_millis(50);
+/// How long to keep looking for a mount that went astray, and how often.
+/// The helper can still be attaching it while this thread reads the table,
+/// so a single reading that shows nothing is not evidence that nothing
+/// happened — and concluding otherwise leaves the stray mount in place.
+const STRAY_WATCH: Duration = Duration::from_secs(2);
+const STRAY_POLL: Duration = Duration::from_millis(25);
 
 struct MountRecord {
     app_id: String,
@@ -236,19 +242,44 @@ impl State {
     fn misplaced_candidates(
         &self,
         before: &HashSet<String>,
-        ours: &HashSet<String>,
+        ours: Option<&HashSet<String>>,
         approved: &Path,
     ) -> Vec<PathBuf> {
         mountinfo::fuse_mounts()
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| {
-                entry.mount_point != approved
-                    && !before.contains(&entry.id)
-                    && ours.contains(&entry.dev)
-            })
+            .filter(|entry| mountinfo::could_be_from_this_operation(entry, approved, before, ours))
             .map(|entry| entry.mount_point)
             .collect()
+    }
+
+    /// The same, but not decided on one instantaneous reading.
+    ///
+    /// `fusermount3` can still be attaching the mount while this thread
+    /// looks, and a reading taken a moment too early shows an empty table —
+    /// from which the daemon would conclude that nothing went astray and
+    /// leave the stray mount behind for good. So keep looking for a bounded
+    /// while. This costs time only on a request that has already failed,
+    /// and the descriptor is held throughout, so anything that does turn up
+    /// is worthless until it is removed.
+    ///
+    /// Found by running the attack suite on systems where the first reading
+    /// happened to lose that race — it is a race, so it hides as soon as
+    /// anything slows the path down.
+    fn watch_for_misplaced(
+        &self,
+        before: &HashSet<String>,
+        ours: Option<&HashSet<String>>,
+        approved: &Path,
+    ) -> Vec<PathBuf> {
+        let deadline = Instant::now() + STRAY_WATCH;
+        loop {
+            let found = self.misplaced_candidates(before, ours, approved);
+            if !found.is_empty() || Instant::now() >= deadline {
+                return found;
+            }
+            std::thread::sleep(STRAY_POLL);
+        }
     }
 
     /// Of those candidates, the ones this daemon actually made.
@@ -399,11 +430,11 @@ impl State {
         // Which FUSE connections and mounts exist now, so the ones this
         // operation creates can be named afterwards — and with them, wherever
         // its mount actually landed.
-        let connections_before = mountinfo::fuse_connections().unwrap_or_default();
+        let connections_before = mountinfo::fuse_connections().unwrap_or(None);
         let mounts_before: HashSet<String> = mountinfo::fuse_mounts()
             .map_err(|e| zbus::fdo::Error::Failed(format!("cannot read mountinfo: {e}")))?
-            .into_iter()
-            .map(|e| e.id)
+            .iter()
+            .map(mountinfo::MountEntry::key)
             .collect();
 
         // fusermount3 reports to the daemon, not to the application: the
@@ -479,11 +510,15 @@ impl State {
         // misplaced mount worthless: dropping it aborts the connection, so
         // the mount answers ENOTCONN instead of whatever the app would serve.
         let fuse_fd = fdpass::recv_fd(ours.as_fd()).unwrap_or_default();
-        let new_connections: HashSet<String> = mountinfo::fuse_connections()
-            .unwrap_or_default()
-            .difference(&connections_before)
-            .cloned()
-            .collect();
+        // `None` all the way through means the kernel is not publishing its
+        // connection list, so this narrowing is unavailable rather than empty.
+        let new_connections: Option<HashSet<String>> = match (
+            connections_before,
+            mountinfo::fuse_connections().unwrap_or(None),
+        ) {
+            (Some(before), Some(now)) => Some(now.difference(&before).cloned().collect()),
+            _ => None,
+        };
 
         let landed = policy::fd_path(&approved.dir).ok();
         let verified = entry.as_ref().is_some_and(|e| e.fstype.starts_with("fuse"))
@@ -500,7 +535,8 @@ impl State {
                 // Ask who is answering while the descriptor is still held:
                 // that is what tells this operation's mount apart from a
                 // filesystem somebody else happens to be starting.
-                let candidates = self.misplaced_candidates(&mounts_before, &new_connections, &mp);
+                let candidates =
+                    self.watch_for_misplaced(&mounts_before, new_connections.as_ref(), &mp);
                 let before_drop = self.liveness_of(&candidates);
                 drop(fuse_fd);
                 let ours = self.we_made(&candidates, &before_drop);
@@ -854,6 +890,14 @@ fn main() {
             .ok()
             .map(|c| c.process_fd().is_some())
     });
+    if !mountinfo::fusectl_mounted() {
+        warn!(
+            "the kernel is not publishing /sys/fs/fuse/connections (fusectl is not mounted): \
+             a mount that lands astray is still made worthless by closing its descriptor, but \
+             recognising it to remove it rests on the liveness transition alone"
+        );
+    }
+
     if own_pidfd == Some(false) {
         warn!(
             "this bus does not supply caller pidfds (needs dbus >= 1.16): callers are \

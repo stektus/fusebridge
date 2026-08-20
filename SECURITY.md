@@ -165,11 +165,27 @@ Recognising which mount to remove is the delicate part, because the mount
 table belongs to the whole session and other programs mount and crash
 whenever they like. Two facts narrow the field — the mount did not exist
 when the operation started, and its FUSE connection appeared while the
-helper ran (connection numbers are reused after an abort, so the number
-alone proves nothing) — and one decides: while the daemon holds the
-descriptor its own mount is connected, and letting go disconnects that mount
-and nothing else in the session. So the mount that *changed* is the
-daemon's. A filesystem somebody is serving answers throughout; one that was
+helper ran — and one decides: while the daemon holds the descriptor its own
+mount is connected, and letting go disconnects that mount and nothing else
+in the session. So the mount that *changed* is the daemon's.
+
+Both narrowing facts are weaker than they look, and getting them wrong is
+how a stray mount stays. Neither the mount id nor the connection number is a
+lasting name: the kernel hands both back and gives them out again, so a
+comparison across time is by id *and* place, never by number alone. And the
+narrowing by connection is only available when the kernel is publishing its
+connection list at all — `/sys/fs/fuse/connections` is an ordinary empty
+directory when `fusectl` is not mounted, which reads exactly like "no
+connections are new". Treating that as an answer switched the cleanup off
+entirely; treated as "unavailable", the decision falls back on the liveness
+transition, which is the part that carries the argument anyway. Finally, the
+question "did anything land astray?" is not answered by one instantaneous
+reading of the mount table, because the helper may still be attaching it —
+so the daemon keeps looking for a bounded while before concluding that
+nothing did.
+
+All three were found by running the attack suite on clean systems rather
+than only on the machine it was written on. A filesystem somebody is serving answers throughout; one that was
 already disconnected belongs to some other program whose server died on its
 own, and deciding when that should be cleaned up is not this daemon's
 business. Both are left alone.
@@ -215,19 +231,33 @@ upstream, and one of the concrete proposals this project carries to
 - **The bridge works for more than one FUSE library.** Verified with rclone
   (a Go implementation) inside a Flatpak sandbox, and with sshfs (libfuse 3,
   C) through the shim: mount, read, write, unmount.
+- **It has been built and tested on more than the machine it was written
+  on.** Clean installs of Debian 12, Fedora 42 and Ubuntu 24.04 in
+  containers: builds from source with no undeclared dependency, `make
+  install` places all three files, and the suite runs with real mounts and
+  nothing skipped. That is where the mount-recognition bugs above came from
+  — two of those systems supply no pidfd (dbus 1.14), all three publish no
+  connection list, and the fuse versions ranged over 3.14.0, 3.16.2 and
+  3.18.2.
 - **`fusermount3` accepts only options it knows, and drops the dangerous
   ones.** An invented option is refused outright (`unknown option
   'totally_made_up_option'`), and asking for `suid` or `dev` is answered with
   `unsafe option ... ignored` — the resulting mount is `nosuid,nodev`
-  regardless of what was requested. Checked on fuse 3.18.2 by driving the
-  helper directly. This bounds what "options are passed through" can mean,
+  regardless of what was requested. Checked by driving the helper directly
+  on fuse 3.18.2 and, identically, on fuse 3.14.0. This bounds what "options
+  are passed through" can mean,
   but it is the helper's rule, not this daemon's, so the daemon does not lean
   on it: the options it forbids, it refuses itself, including padded
   spellings the helper happens to reject today.
 
 ## Known limits
 
-- **A misplaced mount exists briefly**, as described above.
+- **A misplaced mount exists briefly**, as described above — dead from the
+  moment it exists, then removed. "Briefly" is the daemon noticing it and
+  succeeding: it now looks for up to two seconds rather than once, because
+  looking once lost the race often enough to leave the mount there for good.
+  If the removal itself fails, the daemon says so in the journal
+  (`could not remove misplaced mounts`) rather than passing over it.
 - **`auto_unmount` is refused, not supported.** The option asks the helper to
   unmount when the application dies, which it detects by the `_FUSE_COMMFD`
   socket closing. The bridge holds that socket, so the signal never arrives.

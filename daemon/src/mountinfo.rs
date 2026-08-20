@@ -5,16 +5,29 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
-    /// The kernel's id for this mount. Unique among live mounts, so it says
-    /// whether a mount seen now is the same one that was seen earlier.
+    /// The kernel's id for this mount. Unique among *live* mounts only: the
+    /// number is handed back when the mount goes away and given out again
+    /// later, so on its own it does not say that a mount seen now is the one
+    /// seen before. Use [`MountEntry::key`] to compare across time.
     pub id: String,
     pub mount_point: PathBuf,
     pub fstype: String,
     pub source: String,
     /// The mounted filesystem's device, as `major:minor`. For FUSE the minor
     /// is the connection number under /sys/fs/fuse/connections, which is how
-    /// a mount can be tied to the descriptor that serves it.
+    /// a mount can be tied to the descriptor that serves it. Also reused.
     pub dev: String,
+}
+
+impl MountEntry {
+    /// How this mount is recognised again in a later reading. The id alone
+    /// is not enough — it is recycled — so it is paired with where the mount
+    /// sits. A recycled id somewhere new is then correctly a different
+    /// mount, which is the case that matters when deciding whether a mount
+    /// appeared during an operation.
+    pub fn key(&self) -> String {
+        format!("{}@{}", self.id, self.mount_point.display())
+    }
 }
 
 /// Unescape the octal sequences mountinfo uses for special characters
@@ -84,21 +97,59 @@ pub fn fuse_mounts() -> std::io::Result<Vec<MountEntry>> {
         .collect())
 }
 
+/// Whether the kernel is actually publishing its FUSE connection list.
+///
+/// `/sys/fs/fuse/connections` exists as an ordinary empty directory whenever
+/// `fusectl` is not mounted — the usual state inside a container, and not
+/// guaranteed anywhere. Reading it then succeeds and yields nothing, which
+/// is indistinguishable from "there are no connections" unless you look for
+/// the filesystem itself. Getting that wrong is not harmless: it silently
+/// turns "I cannot tell which connection I caused" into "I caused none",
+/// which switches off the cleanup of a mount that landed astray.
+pub fn fusectl_mounted() -> bool {
+    read_table()
+        .map(|content| parse(&content).iter().any(|e| e.fstype == "fusectl"))
+        .unwrap_or(false)
+}
+
 /// The FUSE connections the kernel currently has open, by number.
 ///
 /// A connection appears here the moment `fusermount3` opens `/dev/fuse` and
 /// mounts, so comparing this before and after an operation names exactly the
 /// connection the daemon caused — and `dev` on a mount entry ties that
 /// connection to the mountpoint it ended up on, wherever that turned out
-/// to be.
-pub fn fuse_connections() -> std::io::Result<std::collections::HashSet<String>> {
+/// to be. `None` when the list is not being published at all.
+pub fn fuse_connections() -> std::io::Result<Option<std::collections::HashSet<String>>> {
+    if !fusectl_mounted() {
+        return Ok(None);
+    }
     let mut ids = std::collections::HashSet::new();
     for entry in std::fs::read_dir("/sys/fs/fuse/connections")? {
         if let Some(name) = entry?.file_name().to_str() {
             ids.insert(format!("0:{name}"));
         }
     }
-    Ok(ids)
+    Ok(Some(ids))
+}
+
+/// Could this mount be one this operation caused? It has to sit somewhere
+/// other than the approved directory, and it has to be new.
+///
+/// `connections` narrows that further to mounts whose FUSE connection also
+/// appeared during the operation. It is `None` when the kernel is not
+/// publishing connections, and then the narrowing is simply skipped: what
+/// decides in the end is the liveness transition, which is the argument
+/// that carries the weight anyway. Skipping a narrowing widens the field of
+/// candidates; it does not remove anything on its own.
+pub fn could_be_from_this_operation(
+    entry: &MountEntry,
+    approved: &Path,
+    before: &std::collections::HashSet<String>,
+    connections: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    entry.mount_point != approved
+        && !before.contains(&entry.key())
+        && connections.is_none_or(|c| c.contains(&entry.dev))
 }
 
 /// Read the live mountinfo and find the entry for `mount_point`, if any.
@@ -151,5 +202,91 @@ mod tests {
         assert_eq!(unescape("a\\134b"), "a\\b");
         assert_eq!(unescape("no_escapes"), "no_escapes");
         assert_eq!(unescape("trail\\"), "trail\\");
+    }
+
+    fn entry(id: &str, dev: &str, at: &str) -> MountEntry {
+        MountEntry {
+            id: id.into(),
+            dev: dev.into(),
+            mount_point: PathBuf::from(at),
+            fstype: "fuse.test".into(),
+            source: "test".into(),
+        }
+    }
+
+    /// Without a connection list the narrowing has to be skipped, not
+    /// treated as "no connections are new". Reading it as the latter is what
+    /// silently switched off the removal of a misplaced mount on any system
+    /// where fusectl is not mounted — found by running the suite in a
+    /// container, where the directory exists but stays empty.
+    #[test]
+    fn an_unavailable_connection_list_widens_rather_than_empties_the_field() {
+        let stray = entry("99", "0:157", "/victim/.ssh");
+        let approved = Path::new("/root/a/.ssh");
+        let before = std::collections::HashSet::new();
+
+        // Unavailable: still a candidate, to be decided by liveness.
+        assert!(could_be_from_this_operation(
+            &stray, approved, &before, None
+        ));
+        // Available and matching: a candidate, as before.
+        let ours: std::collections::HashSet<String> = ["0:157".to_string()].into_iter().collect();
+        assert!(could_be_from_this_operation(
+            &stray,
+            approved,
+            &before,
+            Some(&ours)
+        ));
+        // Available and not matching: somebody else's connection.
+        let other: std::collections::HashSet<String> = ["0:2".to_string()].into_iter().collect();
+        assert!(!could_be_from_this_operation(
+            &stray,
+            approved,
+            &before,
+            Some(&other)
+        ));
+    }
+
+    #[test]
+    fn the_approved_mount_and_pre_existing_mounts_are_never_candidates() {
+        let approved = Path::new("/root/a/.ssh");
+        let before: std::collections::HashSet<String> =
+            [entry("7", "0:157", "/somewhere/else").key()]
+                .into_iter()
+                .collect();
+
+        // The mount that landed where it was supposed to.
+        assert!(!could_be_from_this_operation(
+            &entry("99", "0:157", "/root/a/.ssh"),
+            approved,
+            &before,
+            None
+        ));
+        // A mount that was already there when the operation started.
+        assert!(!could_be_from_this_operation(
+            &entry("7", "0:157", "/somewhere/else"),
+            approved,
+            &before,
+            None
+        ));
+    }
+
+    /// Mount ids are handed back and given out again. A stray mount that
+    /// picks up the number of one that has since gone must still count as
+    /// new, or it is never cleaned up — which is why the comparison is by
+    /// id *and* place rather than by id.
+    #[test]
+    fn a_recycled_mount_id_somewhere_new_is_still_a_new_mount() {
+        let approved = Path::new("/root/a/.ssh");
+        let before: std::collections::HashSet<String> = [entry("7", "0:157", "/gone/by/now").key()]
+            .into_iter()
+            .collect();
+
+        assert!(could_be_from_this_operation(
+            &entry("7", "0:157", "/victim/.ssh"),
+            approved,
+            &before,
+            None
+        ));
     }
 }
