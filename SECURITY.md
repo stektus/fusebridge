@@ -139,24 +139,55 @@ On a bus too old to supply a pidfd the daemon falls back to the pid and says
 so in the journal at startup. The `/proc` handle is just as stable there;
 what is weaker is the claim that the pid named the caller in the first place.
 
-**Why that degrades rather than refuses.** Refusing would be the stricter
-default, and the argument for it is good: a flag is a decision, a log line
-is not. Two things decide it the other way. The exposure lands outside the
-threat model — since the bus peer is the proxy and not the application, a
-stale pid needs an attacker who holds a bus connection of their own, and
-such a process is out of scope here because it can run `fusermount3`
-directly. And dbus 1.14 is what Debian stable and Ubuntu LTS ship, so
-refusing by default would switch the bridge off for most of the systems it
-exists for, to close a hole those systems' sandboxed applications cannot
-reach.
+**Why that degrades rather than refuses, and until when.** Refusing would be
+the stricter default, and the argument for it is good: a flag is a decision,
+a log line is not. Two things decide it the other way.
 
-So the strictness is available as a deliberate act instead: **`--require-pidfd`**
-refuses any caller the bus cannot hand over as a descriptor. It is the right
-setting for a deployment that does not need old buses, and it changes
-nothing on a bus that supplies pidfds — pinned by
-`require_pidfd_changes_nothing_on_a_bus_that_supplies_them`. What that test
-cannot cover is the refusal itself: this dbus always offers a pidfd, and
-faking one would be testing a mock rather than the daemon.
+The first is that the exposure lands outside the threat model. Since the bus
+peer is the proxy and not the application, a stale pid needs an attacker who
+holds a bus connection of their own — and such a process is out of scope
+here, because it can run `fusermount3` directly.
+
+The second is who would be shut out. It is a narrower set than it first
+looks, so it is worth being exact rather than saying "old distributions":
+
+| | dbus | pidfd |
+| --- | --- | --- |
+| Debian 13 trixie (current stable) | 1.16.2 | yes |
+| Debian 12 bookworm (oldstable) | 1.14.10 | no |
+| Ubuntu 24.04 LTS noble | 1.14.10 | no |
+| Ubuntu 25.10 | 1.16.2 | yes |
+| Ubuntu 26.04 | 1.16.2 | yes |
+
+Current Debian ships a bus that supplies pidfds. What carries this decision
+is essentially Ubuntu 24.04 LTS alone — supported to April 2029, and
+probably the largest single population of Flatpak users — with Debian
+bookworm (LTS to June 2028) beside it. Refusing by default would switch the
+bridge off there to close a hole those systems' sandboxed applications
+cannot reach.
+
+**So this is a concession with an expiry, not a permanent design.** When
+bookworm and noble are out of support — mid-2028 and April 2029 — nothing
+still in service ships dbus 1.14, and the default should flip: refuse by
+default, with a flag for the fallback rather than for the strictness. That
+decision is made here, conditionally, so it does not have to be argued
+again; what remains is to notice the date.
+
+Until then the strictness is available as a deliberate act:
+**`--require-pidfd`** refuses any caller the bus cannot hand over as a
+descriptor. It changes nothing on a bus that supplies them, which is pinned
+by `require_pidfd_changes_nothing_on_a_bus_that_supplies_them`.
+
+The refusal itself is not left to argument either. On a real dbus 1.14.10
+(Debian 12 in a container, its own session bus, no `ProcessFD` among the
+credentials it offers), the same daemon answering the same request differs
+only by the flag:
+
+- with `--require-pidfd`: `AccessDenied: this bus cannot identify callers by
+  descriptor (needs dbus >= 1.16) and --require-pidfd is set`, and at startup
+  `every request will be refused`;
+- without it: `'/nowhere' is outside the allowed mount roots` — the caller
+  was identified, and the request went on to be judged on policy.
 
 ## The one that needed more than a check
 

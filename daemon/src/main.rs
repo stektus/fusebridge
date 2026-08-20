@@ -1047,12 +1047,15 @@ fn main() {
     // against the adversary this daemon is built for; it is a defence
     // against a local process that already holds its own bus connection —
     // which the threat model puts out of scope anyway, because it can run
-    // fusermount3 itself. Meanwhile dbus 1.14 is what Debian stable and
-    // Ubuntu LTS ship, so refusing by default would turn the bridge off for
-    // most of the people it is for, to close a hole they are not exposed to.
+    // fusermount3 itself. Meanwhile the systems without a pidfd-capable bus
+    // are Ubuntu 24.04 LTS and Debian bookworm, not current Debian, so
+    // refusing by default would turn the bridge off for a large and
+    // long-lived population to close a hole they are not exposed to.
     //
-    // The strictness is available to anyone who wants it, as a deliberate
-    // act rather than a line in a log: --require-pidfd.
+    // This is a concession with an expiry: once those two are out of support
+    // (mid-2028 and April 2029) the default should flip, and the flag should
+    // become the one that asks for the fallback. Until then the strictness
+    // is available as a deliberate act: --require-pidfd. See SECURITY.md.
     if own_pidfd == Some(false) {
         if require_pidfd {
             error!(

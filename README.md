@@ -156,8 +156,9 @@ daemon, which then allows mounts under `~/CloudDrives` (created if missing).
 `--allow-root <dir>` adds another root, `--max-mounts` changes the ceiling,
 and `--require-pidfd` refuses callers the bus cannot hand over as a
 descriptor rather than identifying them by pid — worth setting if every bus
-you care about is dbus 1.16 or newer, which Debian stable and Ubuntu LTS are
-not.
+you care about is dbus 1.16 or newer. Current Debian is; Ubuntu 24.04 LTS
+and Debian bookworm are not, which is why it is not the default. See
+[SECURITY.md](SECURITY.md) for when that flips.
 
 Do not add systemd sandboxing to the unit. `NoNewPrivileges=` breaks the
 setuid helper — that is the very bug this project exists to route around —
