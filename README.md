@@ -17,8 +17,10 @@ concurrently, so no application can make another wait on it. `auto_unmount`
 works: kill the application and its mount goes with it. The zero-install
 fallback (layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME
 (gvfs/SFTP). It builds and passes its tests on clean Debian 12, Fedora 42 and
-Ubuntu 24.04 as well as the machine it was written on. Not yet done: the
-written spec for the portal issue.
+Ubuntu 24.04 as well as the machine it was written on. The interface and the
+threat model are written up as a portal proposal in
+[docs/portal-proposal.md](docs/portal-proposal.md), which has not been sent
+anywhere yet.
 
 ## The problem
 
@@ -51,8 +53,12 @@ built is a narrow, auditable contract for requesting it. Three layers:
    URI only its own file layer understands. Slower than a real mount, but it
    works straight from the store with zero host-side setup.
 3. **The spec** — a threat model (mountpoint shadowing, TOCTOU, foreign
-   unmount) and a D-Bus interface written up as a draft for the portal issue
-   above, with this repository as the reference implementation.
+   unmount) and a D-Bus interface, written up in
+   [docs/portal-proposal.md](docs/portal-proposal.md) as a proposal for the
+   portal issue above, with this repository as the reference implementation.
+   It also carries one request to libfuse — a `fusermount3` that can mount on
+   a directory descriptor — which would remove the need for most of the
+   machinery described under *Security* below.
 
 ## How the bridge works
 
