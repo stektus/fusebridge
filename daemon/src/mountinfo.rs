@@ -132,6 +132,49 @@ pub fn fuse_connections() -> std::io::Result<Option<std::collections::HashSet<St
     Ok(Some(ids))
 }
 
+/// The kernel's non-recycled identifier for the mount that `path` is on.
+///
+/// Everything the mount table offers is reused. Measured on Linux 6.18:
+/// unmount a FUSE filesystem and mount another at the same path, and both
+/// the mount id and the connection number come back identical on the very
+/// next attempt — three times out of three. So the table cannot answer
+/// "is the mount standing here the one I saw here before", which is the
+/// question that decides whether a record still describes anything.
+///
+/// `STATX_MNT_ID_UNIQUE` (Linux 6.8) is documented not to be reused, and was
+/// observed to differ on each of those same three mounts. It also answers
+/// for a mount whose server has died: `ls` on such a mountpoint fails with
+/// ENOTCONN while this still reports the id, which matters because removing
+/// dead mounts is most of what unmounting is for.
+///
+/// `None` when the kernel does not supply it — before 6.8, notably on the
+/// 6.1 kernel of Debian 12 — leaving the caller to fall back on the table.
+pub fn unique_mount_id(path: &Path) -> Option<u64> {
+    // Not in the libc crate yet.
+    const STATX_MNT_ID_UNIQUE: libc::c_uint = 0x4000;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is a valid NUL-terminated string that outlives the
+    // call, and the buffer is owned by this frame.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_SYNC_AS_STAT,
+            STATX_MNT_ID_UNIQUE,
+            &mut stx,
+        )
+    };
+    // The mask is the kernel saying which fields it actually filled: asking
+    // for a field it does not know about is not an error, it is a silence.
+    if rc != 0 || stx.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+        return None;
+    }
+    Some(stx.stx_mnt_id)
+}
+
 /// Could this mount be one this operation caused? It has to sit somewhere
 /// other than the approved directory, and it has to be new.
 ///

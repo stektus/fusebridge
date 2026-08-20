@@ -97,8 +97,10 @@ Policy enforced by the daemon, one journal line per operation:
   allowed root (default `~/CloudDrives`) — this is the defence against
   mounting over `~/.ssh` and similar shadowing attacks;
 - `allow_other`/`allow_root` options are refused;
-- a ceiling on live mounts (`--max-mounts`, 64 by default) keeps one app from
-  filling the session's mount table;
+- a ceiling on live mounts (`--max-mounts`, 64 by default) keeps the session's
+  mount table from filling up, and a ration under it
+  (`--max-mounts-per-app`, 16) keeps one application from spending that
+  ceiling on everyone else's behalf;
 - `auto_unmount` is honoured by the daemon rather than passed on: through the
   bridge the helper would be watching the daemon's socket instead of the
   application's, so the daemon watches the application's own socket and takes
@@ -107,8 +109,10 @@ Policy enforced by the daemon, one journal line per operation:
   filesystem that never answers does not keep the others waiting;
 - after the mount the daemon re-checks what actually got mounted and where;
   anything unexpected is immediately unmounted;
-- unmount is possible only for mounts created through the daemon, and only
-  by the app that created them.
+- unmount is possible only for mounts created through the daemon, and only by
+  the app that created them — and the daemon checks *which mount* is standing
+  there, not just the path, so a stranger's filesystem that took over the
+  mountpoint after ours went away is left alone.
 
 ## Security
 
@@ -139,9 +143,10 @@ a directory answer ENOTCONN for a moment".
 against a real daemon on a private bus, making real FUSE mounts: escape
 outside the allowed root, the root itself, a non-empty mountpoint, a symlink
 and a parent symlink leading out, `allow_other`, a non-Flatpak caller,
-unmounting a mount the daemon did not create, the mount ceiling, a mountpoint
-on a filesystem that has stopped answering, and the race above driven by a
-tuned attacker. Every request in the suite also asserts the rule that makes
+unmounting a mount the daemon did not create, both ceilings, a mountpoint on
+a filesystem that has stopped answering, a stale record whose mountpoint a
+stranger's filesystem has taken over, and the race above driven by a tuned
+attacker. Every request in the suite also asserts the rule that makes
 the race survivable: a refused mount never leaves the application holding a
 descriptor.
 
@@ -159,7 +164,8 @@ sudo make install    # daemon, D-Bus activation file, systemd user service
 
 Nothing needs to be started: the first call from an application activates the
 daemon, which then allows mounts under `~/CloudDrives` (created if missing).
-`--allow-root <dir>` adds another root, `--max-mounts` changes the ceiling,
+`--allow-root <dir>` adds another root, `--max-mounts` and
+`--max-mounts-per-app` change the ceilings,
 and `--require-pidfd` refuses callers the bus cannot hand over as a
 descriptor rather than identifying them by pid — worth setting if every bus
 you care about is dbus 1.16 or newer. Current Debian is; Ubuntu 24.04 LTS

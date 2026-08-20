@@ -78,6 +78,8 @@ happens outside, and the `/dev/fuse` descriptor is passed back in.
 | Expose the mount to other users of the machine | `allow_other`/`allow_root` refused, including smuggled inside another option | `refuses_allow_other`, `rejects_option_smuggling` |
 | Unmount another application's filesystem | Only mounts this daemon made, and only for the app that made them | `refuses_to_unmount_a_mount_it_did_not_create`, `unmount_is_restricted_to_the_owning_app`, plus a live cross-app run (see below) |
 | Fill the session's mount table | A ceiling on live mounts (`--max-mounts`, 64 by default) | `enforces_the_mount_limit` |
+| One application spending that ceiling on everyone else's behalf | A per-application ration under it (`--max-mounts-per-app`, 16 by default), counting requests in flight | `enforces_the_per_application_limit` |
+| Unmount a stranger's filesystem that took over a mountpoint after ours went away | A record names *which mount*, not just which path: the kernel's non-recycled mount id where there is one (Linux 6.8+), the table's id and path otherwise | `a_replacement_mount_is_not_unmounted_on_a_stale_record`, `auto_unmount_does_not_take_a_mount_that_replaced_ours` |
 | Freeze the daemon for everyone | Mountpoint resolution runs on its own thread with a deadline; abandoned checks are counted and capped | `an_unresponsive_filesystem_cannot_wedge_the_daemon` |
 | Make other applications wait | Every request is served on its own worker; mountpoints are claimed so two requests cannot race for one | `a_stuck_request_does_not_hold_up_another_application`, `several_applications_can_mount_at_once` |
 | Impersonate another app by pid reuse, or by handing the bus connection to another process and exiting | The caller is pinned by the pidfd the bus captured together with the pid, confirmed still current after `/proc/<pid>` is opened; uid and app id are then both read through that one handle | `a_pidfd_pins_this_process`, `a_pidfd_whose_process_died_is_refused`, `dead_pid_is_an_error_not_an_identity`, and see below |
@@ -323,6 +325,19 @@ upstream, and one of the concrete proposals this project carries to
   is mounting and unmounting can come back without an entry that was there
   throughout. A record is only dropped after two readings agree it is gone,
   and never because the read failed — but two readings are not a proof.
+- **Recognising "the same mount" is exact only on Linux 6.8 and newer.** A
+  record is keyed by a mountpoint, and the path outlives the mount: if this
+  daemon's mount is removed by other means and another program mounts there,
+  acting on the record would remove a filesystem the daemon never made. The
+  check against that compares mount identity, and identity is where the
+  kernel is unhelpful — measured on 6.18, unmounting a FUSE filesystem and
+  mounting another at the same path hands back *both* the mount id and the
+  connection number, three times out of three. `STATX_MNT_ID_UNIQUE` (6.8)
+  is not reused and settles it; below that the daemon falls back on the
+  recycled id, which recognises the substitution only when the numbers
+  happen to differ. The consequence when it does not is bounded — a FUSE
+  mount of the user's own, inside an allowed root, unmounted when it should
+  not have been — but it is not nothing.
 - **Mount options other than the refused ones are passed through** to
   `fusermount3` as the application gave them. The daemon does not attempt to
   understand them; it relies on nothing about them either (see above).

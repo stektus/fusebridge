@@ -535,6 +535,58 @@ fn auto_unmount_removes_the_mount_when_the_application_dies() {
     );
 }
 
+/// `auto_unmount` says "take my mount down when I die", not "take down
+/// whatever is standing at that path when I die". If our mount was removed
+/// by other means and somebody else's took its place, the watcher must let
+/// it be — the death of the application says nothing about a filesystem it
+/// never owned.
+#[test]
+fn auto_unmount_does_not_take_a_mount_that_replaced_ours() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("autoreplace");
+    let dir = fx.mkdir("drive");
+
+    let app_socket = fx
+        .mount_holding_socket(&dir, &["auto_unmount"])
+        .expect("auto_unmount must be accepted");
+    assert!(is_mounted(&dir));
+
+    // Our mount goes away behind the daemon's back, and a stranger's takes
+    // that place. The record now describes nothing.
+    let st = Command::new(FUSERMOUNT)
+        .args(["-u", "--"])
+        .arg(&dir)
+        .status()
+        .expect("cannot run fusermount3");
+    assert!(st.success(), "the direct unmount must succeed");
+    mount_directly(&dir);
+    assert!(is_mounted(&dir), "the stranger's mount must exist");
+
+    // Now the application dies, which is what the watcher is waiting for.
+    fx.stop_serving();
+    unsafe { libc::close(app_socket) };
+    std::thread::sleep(Duration::from_millis(1500));
+
+    assert!(
+        is_mounted(&dir),
+        "auto_unmount removed a mount the daemon never made\njournal:\n{}",
+        fx.journal()
+    );
+    assert!(
+        fx.journal().contains("leaving it alone"),
+        "the daemon should say why it did nothing\njournal:\n{}",
+        fx.journal()
+    );
+
+    let _ = Command::new(FUSERMOUNT)
+        .args(["-u", "-z", "--"])
+        .arg(&dir)
+        .status();
+}
+
 /// Without the option, the same socket closing must change nothing: an
 /// application that merely finished handing over is not one that has died,
 /// and unmounting there would be the bridge inventing a policy of its own.
@@ -605,6 +657,93 @@ fn refuses_to_unmount_a_mount_it_did_not_create() {
         .args(["-u", "-z", "--"])
         .arg(&dir)
         .status();
+}
+
+/// The registry is keyed by path, and a path outlives the mount that sat on
+/// it. If the daemon's own mount is removed by other means and somebody
+/// else's takes that place, the record describes nothing any more — and
+/// acting on it would unmount a stranger's filesystem, which is the very
+/// thing the daemon refuses to do for a path it has no record of.
+///
+/// The kernel makes this easy to get wrong: measured on 6.18, the mount id
+/// and the FUSE connection number are both handed straight back to the next
+/// mount at the same path, so recognising the replacement takes the
+/// non-recycled id from statx.
+#[test]
+fn a_replacement_mount_is_not_unmounted_on_a_stale_record() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("stale");
+    let dir = fx.mkdir("stale");
+    fx.mount(&dir, &[]).expect("the daemon's own mount");
+
+    // Behind the daemon's back, the way anybody with a terminal can.
+    let st = Command::new(FUSERMOUNT)
+        .args(["-u", "--"])
+        .arg(&dir)
+        .status()
+        .expect("cannot run fusermount3");
+    assert!(st.success(), "the direct unmount must succeed");
+    assert!(!is_mounted(&dir), "the daemon's mount must be gone");
+
+    mount_directly(&dir);
+    assert!(is_mounted(&dir), "the stranger's mount must exist");
+
+    let err = fx.unmount(&dir).unwrap_err();
+    assert!(
+        err.contains("no longer holds the mount"),
+        "expected a refusal naming the replacement, got: {err}\njournal:\n{}",
+        fx.journal()
+    );
+    assert!(
+        is_mounted(&dir),
+        "the refusal must leave the stranger's mount standing"
+    );
+
+    let _ = Command::new(FUSERMOUNT)
+        .args(["-u", "-z", "--"])
+        .arg(&dir)
+        .status();
+}
+
+/// One application must not be able to spend the session's whole allowance.
+#[test]
+fn enforces_the_per_application_limit() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::with_args(
+        "perapp",
+        &[
+            "--allow-unsandboxed",
+            "--max-mounts",
+            "16",
+            "--max-mounts-per-app",
+            "2",
+        ],
+    );
+    let a = fx.mkdir("a");
+    let b = fx.mkdir("b");
+    let c = fx.mkdir("c");
+
+    fx.mount(&a, &[]).expect("first mount");
+    fx.mount(&b, &[]).expect("second mount");
+    let err = fx.mount(&c, &[]).unwrap_err();
+    assert!(
+        err.contains("this application has reached its limit of 2"),
+        "the refusal must be the per-application one, not the session one: {err}"
+    );
+    assert!(!is_mounted(&c), "the refused mount must not exist");
+
+    fx.unmount(&a)
+        .unwrap_or_else(|e| panic!("unmount a: {e}\ndaemon journal:\n{}", fx.journal()));
+    fx.mount(&c, &[])
+        .unwrap_or_else(|e| panic!("a freed slot must be reusable: {e}"));
+    fx.unmount(&b).unwrap();
+    fx.unmount(&c).unwrap();
 }
 
 #[test]

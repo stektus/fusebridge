@@ -42,10 +42,16 @@ const FUSERMOUNT: &str = "/usr/bin/fusermount3";
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Grace period after fusermount3 exits before declaring the mount missing.
 const POST_EXIT_GRACE: Duration = Duration::from_secs(1);
-/// Default ceiling on live mounts. Mountpoints are a finite resource and
-/// each one costs kernel state; without a cap a buggy or hostile app can
-/// fill the mount table for the whole session.
+/// Default ceiling on live mounts across the session. Mountpoints are a
+/// finite resource and each one costs kernel state; without a cap a buggy or
+/// hostile app can fill the mount table for the whole session.
 const DEFAULT_MAX_MOUNTS: usize = 64;
+/// Default ceiling on live mounts for any one application. The session
+/// ceiling alone is not enough: reaching it is precisely how one application
+/// would deny the others service, and everything else here — identity,
+/// ownership of a mount, who may unmount it — is decided per application, so
+/// the ration is too.
+const DEFAULT_MAX_MOUNTS_PER_APP: usize = 16;
 /// How long to wait for fusermount3 to hand over the /dev/fuse descriptor.
 const FD_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to spend resolving a mountpoint before giving up on it.
@@ -68,6 +74,20 @@ struct MountRecord {
     app_id: String,
     fstype: String,
     source: String,
+    /// Which mount this record is about. The map is keyed by path, and a
+    /// path outlives the mount that sat on it: the mount can go away and
+    /// another program's can take its place. Without this the daemon would
+    /// unmount whatever is at the path now — the same mistake it guards
+    /// against on the way in, made on the way out.
+    ///
+    /// Two forms, because the reliable one is not everywhere. `unique_id` is
+    /// the kernel's non-recycled mount id (Linux 6.8), which settles the
+    /// question outright. `key` is `id@mountpoint` from the table, which is
+    /// all an older kernel offers and which recognises a replacement only
+    /// when the recycled number happens to differ — measured, it usually
+    /// does not.
+    key: String,
+    unique_id: Option<u64>,
     /// The fusermount3 child, kept so its zombie is reaped on unmount and so
     /// its stderr pipe is not closed under it if it is still running.
     child: Child,
@@ -89,10 +109,70 @@ struct Caller {
 /// What the daemon knows about mounts: the ones it made, and the mountpoints
 /// it is in the middle of making. Requests run on worker threads, so both
 /// have to be decided together, under one lock.
+///
+/// `in_progress` carries the app id as well as the path, because a request
+/// in flight counts against its application's ration just as a finished
+/// mount does; counting only finished ones would let a burst of concurrent
+/// requests walk past the limit.
 #[derive(Default)]
 struct Registry {
     mounts: HashMap<PathBuf, MountRecord>,
-    in_progress: HashSet<PathBuf>,
+    in_progress: HashMap<PathBuf, String>,
+}
+
+impl Registry {
+    /// How many mounts this application has, counting work in flight.
+    fn held_by(&self, app_id: &str) -> usize {
+        self.mounts.values().filter(|r| r.app_id == app_id).count()
+            + self.in_progress.values().filter(|a| a == &app_id).count()
+    }
+
+    fn live(&self) -> usize {
+        self.mounts.len() + self.in_progress.len()
+    }
+}
+
+/// What the mount table says about a mountpoint the daemon has a record for.
+#[derive(Debug, PartialEq, Eq)]
+enum MountNow {
+    /// Still the mount this record describes.
+    Same,
+    /// Something is mounted there, but not the mount in the record: this
+    /// record's mount was removed by other means and the path was reused.
+    Replaced,
+    /// Nothing is mounted there any more.
+    Gone,
+    /// The table could not be read, which is evidence of nothing.
+    Unknown,
+}
+
+/// Compare a record against the live mount table.
+fn mount_now(mp: &Path, record: &MountRecord) -> MountNow {
+    let entry = match mountinfo::find(mp) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return MountNow::Gone,
+        Err(_) => return MountNow::Unknown,
+    };
+    match (record.unique_id, mountinfo::unique_mount_id(mp)) {
+        // The kernel's non-recycled id: an answer, not a guess.
+        (Some(before), Some(now)) => {
+            if now == before {
+                MountNow::Same
+            } else {
+                MountNow::Replaced
+            }
+        }
+        // No such id to compare — an older kernel, or a path that cannot be
+        // examined right now. Fall back on the table and stay with the
+        // previous behaviour rather than refusing to act.
+        _ => {
+            if entry.key() == record.key {
+                MountNow::Same
+            } else {
+                MountNow::Replaced
+            }
+        }
+    }
 }
 
 struct State {
@@ -102,7 +182,11 @@ struct State {
     /// falling back to their pid. Off by default: see the note by the
     /// startup warning for why the default goes the other way.
     require_pidfd: bool,
+    /// Ceiling for the session, and the share of it any one application may
+    /// hold. The second is what keeps one application from spending the
+    /// first on everyone else's behalf.
     max_mounts: usize,
+    max_mounts_per_app: usize,
     /// Separate bus connection for credential lookups: calling back into the
     /// serving connection from a handler would deadlock the blocking API.
     creds: zbus::blocking::fdo::DBusProxy<'static>,
@@ -217,6 +301,27 @@ impl State {
                 let _ = rec.child.try_wait();
                 info!(
                     "sweep: mount at '{}' (app {}) is gone, dropping record",
+                    mp.display(),
+                    rec.app_id
+                );
+            }
+        }
+
+        // A record whose mountpoint now holds a different mount is stale in
+        // a way no later request can repair: the mount it describes is gone
+        // for good. Unlike a missing entry, a present one is not an artefact
+        // of a partial reading, so one look is enough.
+        let replaced: Vec<PathBuf> = mounts
+            .iter()
+            .filter(|(mp, rec)| mount_now(mp, rec) == MountNow::Replaced)
+            .map(|(mp, _)| mp.clone())
+            .collect();
+        for mp in replaced {
+            if let Some(mut rec) = mounts.remove(&mp) {
+                let _ = rec.child.try_wait();
+                info!(
+                    "sweep: '{}' (app {}) now holds a mount this daemon did not make, \
+                     dropping the stale record",
                     mp.display(),
                     rec.app_id
                 );
@@ -419,6 +524,31 @@ impl State {
             let Some(record) = record else {
                 return; // somebody unmounted it first
             };
+            // The application is gone, but that says nothing about what is
+            // mounted there now. If this record's mount was removed by other
+            // means and the path was reused, the mount standing there belongs
+            // to somebody else and auto_unmount is not a licence to take it.
+            match mount_now(&mp, &record) {
+                MountNow::Same | MountNow::Unknown => {}
+                MountNow::Gone => {
+                    info!(
+                        "auto_unmount app={} mountpoint='{}': the application exited, the mount \
+                         was already gone",
+                        record.app_id,
+                        mp.display()
+                    );
+                    return;
+                }
+                MountNow::Replaced => {
+                    warn!(
+                        "auto_unmount app={} mountpoint='{}': the application exited but another \
+                         mount has taken that place; leaving it alone",
+                        record.app_id,
+                        mp.display()
+                    );
+                    return;
+                }
+            }
             // Release the record — and with it the helper's socket — before
             // unmounting, so nothing is still holding the mount open.
             let app_id = record.app_id.clone();
@@ -495,7 +625,16 @@ impl State {
         let _reservation = {
             let mut registry = self.registry.lock().unwrap();
             self.sweep_stale(&mut registry.mounts);
-            if registry.mounts.len() + registry.in_progress.len() >= self.max_mounts {
+            // The per-application ration first: it is the one that stops an
+            // application from taking the session's whole allowance, which
+            // the session ceiling on its own invites.
+            if registry.held_by(&caller.app_id) >= self.max_mounts_per_app {
+                return Err(deny(format!(
+                    "this application has reached its limit of {} live mounts",
+                    self.max_mounts_per_app
+                )));
+            }
+            if registry.live() >= self.max_mounts {
                 return Err(deny(format!(
                     "the limit of {} live mounts is reached",
                     self.max_mounts
@@ -507,9 +646,14 @@ impl State {
                     mp.display()
                 )));
             }
-            if !registry.in_progress.insert(mp.clone()) {
+            // Checked, not overwritten: inserting first would replace the
+            // owner of a request already in flight before refusing this one.
+            if registry.in_progress.contains_key(&mp) {
                 return Err(deny(format!("'{}' is already being mounted", mp.display())));
             }
+            registry
+                .in_progress
+                .insert(mp.clone(), caller.app_id.clone());
             Reservation {
                 state: Arc::clone(self),
                 path: mp.clone(),
@@ -747,12 +891,16 @@ impl State {
                 ""
             }
         );
+        let key = entry.key();
+        let unique_id = mountinfo::unique_mount_id(&mp);
         self.registry.lock().unwrap().mounts.insert(
             mp,
             MountRecord {
                 app_id: caller.app_id,
                 fstype: entry.fstype,
                 source: entry.source,
+                key,
+                unique_id,
                 child,
                 _comm: ours,
                 _watcher_stop: watcher_stop,
@@ -803,19 +951,43 @@ impl State {
             ));
         }
 
-        // Already gone? Just drop the record.
-        if mountinfo::find(&mp)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("cannot read mountinfo: {e}")))?
-            .is_none()
-        {
-            let mut rec = mounts.remove(&mp).unwrap();
-            let _ = rec.child.try_wait();
-            info!(
-                "unmount app={} mountpoint='{}': already gone, record dropped",
-                caller.app_id,
-                mp.display()
-            );
-            return Ok(());
+        // Is the mount at that path still the one this record was written
+        // for? The record is keyed by path, and the path can outlive the
+        // mount. Unmounting on the strength of the path alone would let the
+        // daemon remove a mount somebody else made — which is exactly what
+        // it refuses to do for a mountpoint it has no record of at all.
+        match mount_now(&mp, record) {
+            MountNow::Same => {}
+            MountNow::Gone => {
+                let mut rec = mounts.remove(&mp).unwrap();
+                let _ = rec.child.try_wait();
+                info!(
+                    "unmount app={} mountpoint='{}': already gone, record dropped",
+                    caller.app_id,
+                    mp.display()
+                );
+                return Ok(());
+            }
+            MountNow::Replaced => {
+                let rec = mounts.remove(&mp).unwrap();
+                warn!(
+                    "DENY unmount app={} pid={} mountpoint='{}': the mount this daemon made \
+                     there is gone and another one has taken its place; stale record dropped",
+                    caller.app_id,
+                    caller.pid,
+                    mp.display()
+                );
+                drop(rec);
+                return Err(zbus::fdo::Error::AccessDenied(format!(
+                    "'{}' no longer holds the mount this daemon made there",
+                    mp.display()
+                )));
+            }
+            MountNow::Unknown => {
+                return Err(zbus::fdo::Error::Failed(
+                    "cannot read mountinfo to confirm the mount".into(),
+                ));
+            }
         }
 
         let mut cmd = Command::new(FUSERMOUNT);
@@ -925,10 +1097,13 @@ fn print_usage() {
     eprintln!(
         "usage: fusebridged [--allow-root <dir>]... [--allow-unsandboxed]\n\
          \x20                  [--no-default-root] [--max-mounts <n>]\n\
-         \x20                  [--require-pidfd]\n\
+         \x20                  [--max-mounts-per-app <n>] [--require-pidfd]\n\
          \n\
          Mountpoints are allowed only strictly inside the allowed roots\n\
          (default: ~/CloudDrives, created if missing).\n\
+         \n\
+         --max-mounts is the ceiling for the whole session;\n\
+         --max-mounts-per-app is what any one application may hold of it.\n\
          \n\
          --require-pidfd refuses callers the bus cannot hand over as a\n\
          descriptor, instead of identifying them by pid. Needs dbus >= 1.16."
@@ -943,6 +1118,7 @@ fn main() {
     let mut require_pidfd = false;
     let mut default_root = true;
     let mut max_mounts = DEFAULT_MAX_MOUNTS;
+    let mut max_mounts_per_app = DEFAULT_MAX_MOUNTS_PER_APP;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -964,6 +1140,13 @@ fn main() {
                 Some(Ok(n)) if n > 0 => max_mounts = n,
                 _ => {
                     error!("--max-mounts needs a positive number");
+                    std::process::exit(2);
+                }
+            },
+            "--max-mounts-per-app" => match args.next().map(|v| v.parse::<usize>()) {
+                Some(Ok(n)) if n > 0 => max_mounts_per_app = n,
+                _ => {
+                    error!("--max-mounts-per-app needs a positive number");
                     std::process::exit(2);
                 }
             },
@@ -1077,6 +1260,7 @@ fn main() {
             allow_unsandboxed,
             require_pidfd,
             max_mounts,
+            max_mounts_per_app,
             creds,
             registry: Mutex::new(Registry::default()),
         }),
@@ -1092,10 +1276,11 @@ fn main() {
         });
 
     info!(
-        "fusebridged {} listening on {} (max {} mounts)",
+        "fusebridged {} listening on {} (max {} mounts, {} per application)",
         env!("CARGO_PKG_VERSION"),
         fusebridge_proto::BUS_NAME,
-        max_mounts
+        max_mounts,
+        max_mounts_per_app
     );
     loop {
         std::thread::park();
