@@ -616,6 +616,47 @@ fn a_component_swap_cannot_redirect_the_mount() {
     );
 }
 
+/// An application can stop answering on a filesystem it serves and then ask
+/// for a mount inside it. Resolving that path blocks in the kernel forever,
+/// so a daemon that resolved it in its only thread would never serve anyone
+/// again. It must give up and carry on.
+#[test]
+fn an_unresponsive_filesystem_cannot_wedge_the_daemon() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
+        return;
+    }
+    let fx = Fixture::new("wedge");
+    let hung = fx.mkdir("hung");
+    let after = fx.mkdir("after");
+
+    // The fixture holds the descriptor and answers nothing: from here on
+    // any path through this mount hangs.
+    fx.mount(&hung, &[]).expect("the bait must mount");
+    assert!(is_mounted(&hung));
+
+    // On a regression this call never returns at all, so it is made from a
+    // thread the test can stop waiting for — a failure beats a hung suite.
+    let bait = hung.join("inside");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = sender.send(fx.mount(&bait, &[]));
+        });
+        match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(outcome) => {
+                let err = outcome.expect_err("a path into a dead filesystem must not mount");
+                assert!(err.contains("not responding"), "{err}");
+            }
+            Err(_) => panic!("the daemon never gave up on an unresponsive filesystem"),
+        }
+    });
+
+    // Still serving everyone else.
+    fx.mount(&after, &[]).expect("the daemon must still work");
+    assert!(is_mounted(&after));
+}
+
 /// A mount made without going through the daemon, for the foreign-unmount
 /// test: the same protocol, driven directly.
 fn mount_directly(dir: &Path) {

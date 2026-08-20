@@ -4,15 +4,18 @@ FUSE mounts for sandboxed apps — without handing the app the keys to the host.
 
 ## Status
 
-**Working prototype, hardened against the attacks it claims to stop.** The
-bridge (daemon + shim) performs a full mount → I/O → unmount cycle for an
-unmodified rclone running inside a Flatpak sandbox, with the mount visible to
-the whole host. Every policy rule is exercised by the test suite against a
-real daemon making real mounts, including the mountpoint-shadowing race
-described below. The zero-install fallback (layer 2) is verified live on KDE
-(kio-fuse/WebDAV) and GNOME (gvfs/SFTP). Not yet done: D-Bus activation and
-packaging, a second and third application beyond rclone, and the written
-spec for the portal issue.
+**Working prototype, hardened against the attacks it claims to stop, and
+installable.** The bridge (daemon + shim) performs a full
+mount → I/O → unmount cycle for two unmodified applications — rclone (a Go
+FUSE implementation) inside a Flatpak sandbox, and sshfs (libfuse 3) through
+the shim — with the mount visible to the whole host. Every policy rule is
+exercised by the test suite against a real daemon making real mounts,
+including the mountpoint-shadowing race; the threat model is written down in
+[SECURITY.md](SECURITY.md). `make install` sets up D-Bus activation, verified
+by watching the daemon start on the first call. The zero-install fallback
+(layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME (gvfs/SFTP).
+Not yet done: the written spec for the portal issue, and a worker per request
+so one application cannot make others wait.
 
 ## The problem
 
@@ -57,6 +60,12 @@ fd passing is native to D-Bus. So:
 - **`fusebridge-shim`** is installed inside the sandbox as
   `/app/bin/fusermount3`. It forwards the socket and the mount arguments to
   the daemon over one D-Bus name. The application is not modified at all.
+  *Where* it has to go depends on the library: go-fuse and friends look
+  `fusermount3` up on `PATH`, but libfuse spawns the absolute
+  `FUSERMOUNT_DIR/fusermount3` it was compiled with and only falls back to
+  `PATH` if that fails. An application bundling libfuse builds it with
+  `--prefix=/app`, so the shim belongs at `/app/bin/fusermount3` for both
+  cases — putting it on `PATH` alone is not enough.
 - **`fusebridged`** runs on the host as a session daemon — no root, no
   setuid. It checks policy, then runs the host's own `fusermount3`, which
   performs the privileged step exactly as it would in a terminal and hands
@@ -103,56 +112,51 @@ else is dead on arrival, serves nothing to anybody, and is then removed. The
 attack turns from "shadow `~/.ssh` with a filesystem you control" into "make
 a directory answer ENOTCONN for a moment".
 
-Identifying that stray mount is done by three facts together, because the
-mount table belongs to the whole session: it did not exist when the operation
-started, its FUSE connection appeared while the helper ran (connection
-numbers are reused after an abort, so that alone proves nothing), and it died
-exactly when the daemon dropped the descriptor. A filesystem somebody else
-mounted at that moment is left alone.
-
 `cargo test` runs the attack suite in [daemon/tests/attacks.rs](daemon/tests/attacks.rs)
 against a real daemon on a private bus, making real FUSE mounts: escape
 outside the allowed root, the root itself, a non-empty mountpoint, a symlink
 and a parent symlink leading out, `allow_other`, a non-Flatpak caller,
-unmounting a mount the daemon did not create, the mount ceiling, and the race
-above driven by a tuned attacker. Every request in the suite also asserts the
-rule that makes the race survivable: a refused mount never leaves the
-application holding a descriptor. The race test additionally asserts that the
-attacker *did* get past the mountpoint check, so it cannot pass by accident.
+unmounting a mount the daemon did not create, the mount ceiling, a mountpoint
+on a filesystem that has stopped answering, and the race above driven by a
+tuned attacker. Every request in the suite also asserts the rule that makes
+the race survivable: a refused mount never leaves the application holding a
+descriptor.
 
-Known and deliberate limits:
+The full threat model — who the adversary is, what is out of scope, which
+test backs which claim, and what is still weak — is in
+[SECURITY.md](SECURITY.md).
 
-- **App ids identify sandboxed callers, nothing else.** A process that can
-  create a user namespace can chroot into a forged root and claim any app id;
-  verified by doing it, and by taking over another app's mount that way. It
-  gains nothing — such a process is unsandboxed and can run `fusermount3`
-  directly — and the callers this policy governs cannot do it: Flatpak's
-  seccomp filter refuses `unshare(CLONE_NEWUSER)` inside the sandbox, with
-  and without `--devel` (checked on flatpak 1.18.1).
-- **The daemon is single-threaded.** A mount request can hold it for up to
-  15 seconds, and a hung filesystem on the path to a mountpoint can block it
-  for longer. Not a hole, but a denial of service one app can inflict on
-  another; it wants a worker per request before this is fit to ship.
-- **A redirected mount still exists for a moment.** It is dead and unserved
-  from the instant it appears, and removed before the request returns, but
-  the window is real. Closing it properly needs `fusermount3` to accept a
-  directory descriptor instead of a path — which is one of the concrete
-  proposals this project takes to the portal issue.
-
-## Try it
+## Install
 
 ```sh
-cargo build --release                                            # daemon
-cargo build --release -p fusebridge-shim \
-    --target x86_64-unknown-linux-musl                           # static shim
+make                 # build the daemon
+make check           # fmt, clippy, and the attack suite
+sudo make install    # daemon, D-Bus activation file, systemd user service
+```
 
-# Host side:
-./target/release/fusebridged            # allows mounts under ~/CloudDrives
+Nothing needs to be started: the first call from an application activates the
+daemon, which then allows mounts under `~/CloudDrives` (created if missing).
+`--allow-root <dir>` adds another root, `--max-mounts` changes the ceiling.
 
-# Application manifest (Flatpak):
-#   * bundle the shim as /app/bin/fusermount3
-#   * finish-args: --talk-name=io.github.stektus.FuseBridge1
-# The app's normal FUSE code path then just works:
+Do not add systemd sandboxing to the unit. `NoNewPrivileges=` breaks the
+setuid helper — that is the very bug this project exists to route around —
+and anything giving the service its own mount namespace (`PrivateTmp`,
+`ProtectHome`, `ProtectSystem=strict`) hides the mounts from the rest of the
+session. The shipped unit says so too.
+
+## Using it from an application
+
+```sh
+make shim            # static, so it runs on any runtime
+make install-shim    # to $(LIBDIR)/fusebridge/fusermount3, for packagers
+```
+
+In the Flatpak manifest: bundle that binary as `/app/bin/fusermount3` and add
+`--talk-name=io.github.stektus.FuseBridge1` to `finish-args`. Nothing else —
+no `--device=all`, and emphatically not `--talk-name=org.freedesktop.Flatpak`.
+The application's own FUSE code path then works unchanged:
+
+```sh
 rclone mount remote: ~/CloudDrives/remote
 ```
 

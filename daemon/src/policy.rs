@@ -18,6 +18,19 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Checks still stuck in the kernel, and how many are tolerated.
+///
+/// Resolving a path can block forever — the path may lead through a FUSE
+/// mount whose server has stopped answering, and an application can arrange
+/// exactly that with a mount of its own. Each check therefore runs on its
+/// own thread and is abandoned if it does not come back in time. Abandoned
+/// threads are counted, and once too many are stuck the daemon stops
+/// starting new ones rather than accumulating them without limit.
+static STUCK_CHECKS: AtomicUsize = AtomicUsize::new(0);
+const MAX_STUCK_CHECKS: usize = 32;
 
 /// Mount options the daemon refuses to forward. `allow_other`/`allow_root`
 /// would expose the sandboxed filesystem to other users of the machine.
@@ -58,6 +71,38 @@ pub fn fd_path(dir: &File) -> Result<PathBuf, String> {
         return Err("the mountpoint was removed while it was being checked".into());
     }
     Ok(path)
+}
+
+/// Validate a mountpoint request, giving up if the filesystem it sits on
+/// does not answer. See `STUCK_CHECKS`: without a deadline here, one
+/// application could stop the daemon serving anyone else, for good.
+pub fn check_mountpoint_within(
+    raw: &str,
+    allowed_roots: &[PathBuf],
+    timeout: Duration,
+) -> Result<Approved, String> {
+    if STUCK_CHECKS.load(Ordering::Relaxed) >= MAX_STUCK_CHECKS {
+        return Err(
+            "too many mountpoint checks are stuck on filesystems that are not responding".into(),
+        );
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let raw_owned = raw.to_string();
+    let roots = allowed_roots.to_vec();
+    STUCK_CHECKS.fetch_add(1, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let result = check_mountpoint(&raw_owned, &roots);
+        STUCK_CHECKS.fetch_sub(1, Ordering::Relaxed);
+        // If nobody is listening any more the descriptor is dropped here,
+        // which is what should happen to a mountpoint nobody waited for.
+        let _ = sender.send(result);
+    });
+    receiver.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(format!(
+            "'{raw}' did not answer within {} seconds: the filesystem it sits on is not responding",
+            timeout.as_secs()
+        ))
+    })
 }
 
 /// Validate a mountpoint request, returning it pinned by a descriptor.

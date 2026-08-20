@@ -1,0 +1,28 @@
+[Unit]
+Description=FUSE mount bridge for sandboxed applications
+Documentation=https://github.com/stektus/fusebridge
+
+[Service]
+Type=dbus
+BusName=io.github.stektus.FuseBridge1
+ExecStart=@BINDIR@/fusebridged
+Restart=on-failure
+RestartSec=2
+
+# No sandboxing directives here, and that is deliberate — two kinds of them
+# would break the service outright:
+#
+#   * NoNewPrivileges=yes stops the setuid fusermount3 from gaining the
+#     privilege it needs. That is precisely the restriction this project
+#     exists to work around; setting it here would reproduce the bug.
+#   * Anything that gives the service its own mount namespace —
+#     PrivateTmp, ProtectHome, ProtectSystem=strict, ReadOnlyPaths and
+#     friends — makes the mounts land in that private namespace, where the
+#     rest of the session cannot see them. The whole point is a mount the
+#     user's other programs can use.
+#
+# The daemon holds no privilege of its own: it runs as the user, and the
+# privileged step is the same setuid helper the user could run in a shell.
+
+[Install]
+WantedBy=default.target

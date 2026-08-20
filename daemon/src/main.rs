@@ -48,6 +48,8 @@ const POST_EXIT_GRACE: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_MOUNTS: usize = 64;
 /// How long to wait for fusermount3 to hand over the /dev/fuse descriptor.
 const FD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to spend resolving a mountpoint before giving up on it.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Attempts to remove a mount that must not stay, and the pause between them.
 const REVERT_ATTEMPTS: usize = 40;
 const REVERT_PAUSE: Duration = Duration::from_millis(50);
@@ -242,7 +244,9 @@ impl Bridge {
 
         // From here on the mountpoint is held open: the descriptor, not the
         // path, is what gets mounted on.
-        let approved = policy::check_mountpoint(&mountpoint, &self.allowed_roots).map_err(&deny)?;
+        let approved =
+            policy::check_mountpoint_within(&mountpoint, &self.allowed_roots, RESOLVE_TIMEOUT)
+                .map_err(&deny)?;
         let mp = approved.path.clone();
 
         if mounts.contains_key(&mp) {
