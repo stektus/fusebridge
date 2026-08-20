@@ -55,6 +55,32 @@ path; something in the sandbox has to answer to the name `fusermount3`, and
 that something forwards the request over D-Bus. The filesystem daemon never
 leaves the sandbox. Only the attach happens outside.
 
+### 2.1 Why not `fsopen`/`fsmount`/`move_mount`?
+
+Because a portal is an ordinary unprivileged session process, and the new
+mount API needs `CAP_SYS_ADMIN` in the caller's mount namespace exactly as
+`mount(2)` does. Measured on Linux 6.18 as the session user:
+
+```
+fsopen("fuse")  = -1  Operation not permitted
+fsopen("tmpfs") = -1  Operation not permitted
+mount(2) tmpfs  = -1  Operation not permitted
+```
+
+A process can give itself that capability by creating its own user and mount
+namespace, and then the whole chain works: inside `unshare -Urm`,
+`fsopen` → `fsconfig` → `fsmount` → `move_mount` all succeed. But the mount
+then exists only in that namespace. With a tmpfs mounted on a directory
+there, a file written into it is visible from inside while the same path
+reads as an empty directory from the session, and the host's mount table has
+no entry for it at all. A mount other programs can see is the one thing this
+feature has to deliver, so the namespace route is not a route.
+
+That leaves the setuid helper as the only carrier of the privilege, which is
+why this proposal is shaped around `fusermount3` rather than around the
+syscalls — and why section 8 asks libfuse for a change rather than asking the
+kernel for one.
+
 ## 3. Shape: this belongs with the Documents portal, not the UI portals
 
 The Request/Response pattern used by the UI portals fits interactions that show
@@ -64,17 +90,28 @@ is blocked waiting. The closest existing sibling is
 `org.freedesktop.portal.Documents`: a plain D-Bus service with direct returns
 and fd passing. I would model it on that.
 
+A sibling, though, and not an extension. The document portal runs a FUSE
+filesystem of its own to export *host* files *into* sandboxes, under its own
+control. This one attaches a filesystem the *sandbox* serves and exports it
+*out* to the host — the opposite direction, and the opposite trust flow: there
+the portal is the server and the sandbox the client, here the sandbox is the
+server and every program on the host a potential client. The overlap worth
+having is in the machinery, not the filesystem: app identification, the
+fd-passing contract, the activation model.
+
 ## 4. Proposed interface
 
 ```
 interface org.freedesktop.portal.Fuse {
 
-    /* Attach a FUSE filesystem at `mountpoint` and return the
-       /dev/fuse descriptor for the caller to serve. */
+    /* Attach a FUSE filesystem at `mountpoint`. `comm_fd` is the caller's
+       own end of the socketpair its FUSE library made: the portal writes
+       the /dev/fuse descriptor into it, exactly as fusermount3 would, and
+       keeps its copy for as long as the mount lives. */
     Mount(in  s      mountpoint,     /* absolute path */
           in  as     options,        /* fusermount3 mount options */
-          in  a{sv}  extra,          /* future use; unknown keys rejected */
-          out h      fuse_fd);
+          in  h      comm_fd,
+          in  a{sv}  options_extra);
 
     Unmount(in s mountpoint,
             in b lazy);
@@ -86,16 +123,32 @@ interface org.freedesktop.portal.Fuse {
 }
 ```
 
-**Returning the descriptor over D-Bus, rather than taking the caller's socket.**
-My implementation does the other thing — the shim passes its `_FUSE_COMMFD`
-socket to the daemon, and the daemon writes the descriptor into it. Both work.
-The signature above is cleaner: the portal never touches the application's
-socket, and the sandbox-side shim does the one thing it is already in a
-position to do. But it gives up a signal that turns out to matter, and
-section 7 is about that; if the trade is not worth it, the socket-taking
-signature is the alternative. What is *not* negotiable either way is that
-**the portal receives the `/dev/fuse` descriptor from `fusermount3` first**,
-and releases it only after checking the mount. That is section 6.
+**Taking the caller's socket rather than returning the descriptor over the
+bus.** The obvious alternative is `Mount(... out h fuse_fd)`, with the
+sandbox-side shim writing the descriptor into its own socket. It is a
+cleaner-looking signature and I proposed it first. The reason to prefer the
+one above is in section 7, in one line: the socket is simultaneously the
+transport and an exact liveness signal, and libfuse's own semantics make it
+exact. The alternative signature has no signal at all — the shim exits
+milliseconds after a successful mount, so its bus connection is gone while
+the mount is young, and there is nothing whose lifetime matches the mount to
+watch. Anything the `out h` version does to recover that ends up being a
+descriptor the caller passes in, which is this signature with an extra step.
+
+What is not negotiable either way: **the portal receives the `/dev/fuse`
+descriptor from `fusermount3` first**, and releases it only after checking
+the mount. That is section 6.
+
+**`options_extra` follows the portal convention: unknown keys are ignored,
+not refused**, and a client that needs to know whether a key is understood
+checks the `version` property first. Refusing them would be the stricter
+reading, and for a security-relevant interface that is tempting — an option
+the caller believed was applied and silently was not is a real hazard. The
+convention wins anyway, because refusing breaks forward compatibility in the
+worse direction: a new client would fail outright against an old portal
+instead of degrading. The rule that keeps it safe is that anything
+security-relevant goes in behind a `version` bump, so a client can tell
+before it relies on it.
 
 **`mountpoint` is a path, not a descriptor**, because the caller has no
 descriptor to give that would mean anything on the host side. This is the
@@ -138,6 +191,16 @@ Three honest qualifications:
   for sure"*. A FUSE portal built on that machinery inherits whatever that TODO
   resolves to, which is an argument for resolving it.
 
+And one property of the app id that a specification should state rather than
+imply: **it identifies sandboxed callers and nobody else.** A process that can
+create a user namespace can chroot into a forged root and present any
+`.flatpak-info` it likes — I verified this by doing it, including taking over
+another app's mount. It gains nothing, because a process that unprivileged
+can already run `fusermount3` itself; the policy governs applications that
+cannot, and inside a Flatpak sandbox the forgery is unavailable because the
+seccomp filter refuses `unshare(CLONE_NEWUSER)`. But the app id is an
+attribution, not an authentication, and it should be documented as one.
+
 **5.2 Confine the mountpoint.** Mounting over `~/.ssh` so that the next `ssh`
 reads keys the attacker supplies is the motivating attack, and it needs no read
 access to the victim. The mountpoint must be an empty, user-owned directory
@@ -150,11 +213,36 @@ inode rather than a name.
 whitelist and forces `nosuid,nodev` — but a portal should not depend on the
 spellings somebody else's parser happens to tolerate.
 
-**5.4 Cap the number of live mounts per session.** Mount table entries are a
-finite shared resource.
+**5.4 Cap the number of live mounts per application, under a session
+ceiling.** Mount table entries are a finite shared resource, so the session
+needs a ceiling — but a ceiling alone is a denial-of-service instrument in
+the hands of the first application to reach it. Everything else here is
+decided per application; the ration should be too. My implementation now
+does both (16 per application under a session ceiling of 64), with requests
+in flight counted against the ration, since otherwise a burst of concurrent
+requests walks past it.
 
 **5.5 Restrict unmount** to mounts the portal made, and to the app that made
-them.
+them — and check *which mount*, not just which path.
+
+A record is keyed by a path, and the path outlives the mount that sat on it.
+If the portal's mount is removed by other means and another program mounts
+there, acting on the record removes a stranger's filesystem — the very thing
+the portal refuses to do for a path it has no record of at all. The same
+applies to `auto_unmount`: the death of an application says nothing about a
+filesystem it never owned.
+
+The kernel makes this easy to get wrong. Measured on 6.18: unmount a FUSE
+filesystem and mount another at the same path, and **both the mount id and
+the FUSE connection number come back identical** — three times out of three,
+on the very next attempt. Nothing in `/proc/self/mountinfo` distinguishes the
+two mounts. What does is `STATX_MNT_ID_UNIQUE` (Linux 6.8), documented as
+never reused and observed to differ on each of those mounts; it also answers
+for a mount whose server has died, where `ls` fails with `ENOTCONN`, which
+matters because removing dead mounts is most of what unmounting is for. On
+older kernels — Debian 12 runs 6.1 — there is no exact answer available, and
+the check degrades to the recycled id, which catches a replacement only when
+the number happens to differ.
 
 **5.6 Serve requests concurrently.** A mountpoint on a filesystem that has
 stopped answering blocks the request that touches it — `lstat` on a hung FUSE
@@ -220,9 +308,12 @@ the revert path above will meet them.
    it as "there are no FUSE connections" rather than "I cannot observe
    connections" silently disabled the check that finds the stray mount.
    Measured: 2 failures in 3 runs.
-2. **Mount ids are reused by the kernel.** A fresh mount that inherited a
-   retired id looks pre-existing if you compare by id alone. Compare id *and*
-   mountpoint. With only bug 1 fixed: 3 failures in 10 runs.
+2. **Mount ids are reused by the kernel**, promptly. A fresh mount that
+   inherited a retired id looks pre-existing if you compare by id alone.
+   Compare id *and* mountpoint. With only bug 1 fixed: 3 failures in 10 runs.
+   And that pairing is only enough for "did this appear during my operation":
+   for "is this still the same mount" it is not enough at all, because at one
+   path the id comes straight back — see 5.5.
 3. **One instantaneous reading of `/proc/self/mountinfo` decides nothing** —
    `fusermount3` may not have finished attaching. Watch for a short window
    (2 s) instead of looking once.
@@ -230,7 +321,7 @@ the revert path above will meet them.
 With all three fixed: 0 failures in 15 runs, then 8 of 8 clean runs on Debian
 and on Ubuntu.
 
-## 7. `auto_unmount`, and what it costs the interface in section 4
+## 7. `auto_unmount`, and why it decides the signature in section 4
 
 `auto_unmount` asks the helper to take the mount down when the application
 dies. Through a portal the helper is on the wrong side of the boundary: it
@@ -264,21 +355,30 @@ purpose-written libfuse3 filesystem and `kill -9`: the mount went away, and
 `Unmount` was never called. Negative control: with the watcher disabled the
 test fails with "the mount outlived the application despite auto_unmount".
 
-**This is the cost of the section 4 signature.** A portal that returns the
+**This is what decides the signature in section 4.** A portal that returns the
 descriptor over the bus and never touches the application's socket has no such
-signal, and needs one of:
+signal, and the substitutes are worse:
 
-- watching the caller's bus connection for disconnect. For a Flatpak caller the
-  peer is `xdg-dbus-proxy`, whose lifetime tracks the app *instance* rather
-  than any one process — plausible, but I have not verified that it exits when
-  the instance is killed;
-- or taking a descriptor from the caller purely as a liveness token, which
-  makes the dependency explicit at the cost of a stranger-looking interface.
+- *Watch the caller's bus connection.* The caller is the shim, and the shim
+  exits within milliseconds of a successful mount — that is what `fusermount3`
+  does, and the reason libfuse `waitpid()`s for it. Its connection is therefore
+  gone while the mount is new and perfectly healthy, so this signal fires on
+  every mount, immediately, and means nothing.
+- *Watch the sandbox instance instead.* This one is real: verified by killing
+  a running instance, `flatpak kill` and `kill -9` on the process inside the
+  sandbox both take the instance's `xdg-dbus-proxy` down with it, within about
+  four seconds. But it is coarser than the mount it is standing in for — an
+  application with several processes in one sandbox keeps its instance, and
+  its bus connections, after the process serving the filesystem has died.
+- *Take a descriptor from the caller purely as a liveness token.* This works,
+  and it is the section 4 signature with an extra argument: the token that
+  would do the job exactly is the socket.
 
-Leaving it to the sandbox side does not work: real `fusermount3` with
+Leaving it to the sandbox side does not work either: real `fusermount3` with
 `auto_unmount` survives as an orphan and unmounts on EOF, and a shim could do
 the same, but when the whole sandbox is torn down the shim dies with it and
-nobody unmounts. The watcher has to be outside.
+nobody unmounts. The watcher has to be outside, and the thing worth watching
+is the socket.
 
 ## 8. One concrete request upstream, to libfuse
 
@@ -287,10 +387,19 @@ without resolving a path.**
 
 Everything in section 6 is a workaround for the second resolution. With a
 `fusermount3` that accepts an already-open directory fd — inherited across
-`exec`, named by number — the check and the mount would describe the same
-inode, the race would not exist, and a portal would need neither the
-descriptor-withholding machinery nor the revert path. The interface could then
-be honest about it and take a directory descriptor from the caller as well.
+`exec`, named by number, say `fusermount3 --mountpoint-fd=N` — the check and
+the mount would describe the same inode, the race would not exist, and a
+portal would need neither the descriptor-withholding machinery nor the revert
+path. The interface could then be honest about it and take a directory
+descriptor from the caller as well.
+
+Concretely, `fuse_mnt_resolve_path` and the `chdir` after it are what would
+be skipped; the attach itself can address the descriptor directly with
+`move_mount(mfd, "", dirfd, "", MOVE_MOUNT_F_EMPTY_PATH)` on a kernel new
+enough for the new mount API, and `fchdir(dirfd)` followed by mounting on
+`"."` — never re-deriving a path from the argument — on one that is not. The
+setuid check that matters (`is this directory the caller's to mount on`) is
+the same either way, and reads the descriptor rather than a name.
 
 This is a small change in a well-defined place, and the portal work does not
 depend on it: the design above works without it, at the cost of a short-lived
@@ -298,9 +407,10 @@ dead mount and a good deal of complexity that exists only to detect one.
 
 ## 9. What the reference implementation demonstrates
 
-A session daemon and a static shim: 2062 lines of Rust and 1577 of tests. It is
-a prototype, not a product — no releases yet, and the bus name sits in a
-personal namespace precisely because it should move if this idea goes anywhere.
+A session daemon and a static shim: about 2300 lines of Rust and 1700 of
+tests. It is a prototype, not a product — no releases yet, and the bus name
+sits in a personal namespace precisely because it should move if this idea
+goes anywhere.
 
 - **Unmodified applications.** Full mount → read → write → unmount for rclone
   (a Go FUSE implementation) inside a real Flatpak sandbox, and for sshfs
@@ -308,21 +418,24 @@ personal namespace precisely because it should move if this idea goes anywhere.
   `--talk-name=<the bus name>` and nothing else: no `--device=all` — the host's
   `fusermount3` opens `/dev/fuse` — and emphatically not
   `--talk-name=org.freedesktop.Flatpak`.
-- **62 tests**, of which 18 are integration tests against a real daemon on a
+- **65 tests**, of which 21 are integration tests against a real daemon on a
   private bus, making real FUSE mounts: escapes outside the root, the root
   itself, non-empty mountpoints, symlinks in the last and in a parent
   component, `allow_other`, a non-Flatpak caller, unmounting somebody else's
-  mount, the ceiling, a mountpoint on a filesystem that has stopped answering,
-  concurrent callers, `auto_unmount` on a killed application, and the race in
-  section 6 driven by a tuned attacker. Every request in the suite also asserts
-  the rule that makes the race survivable: a refused mount never leaves the
-  application holding a descriptor.
+  mount, both ceilings, a mountpoint on a filesystem that has stopped
+  answering, concurrent callers, `auto_unmount` on a killed application, a
+  stale record whose path has been taken over by a stranger's mount, and the
+  race in section 6 driven by a tuned attacker. Every request in the suite
+  also asserts the rule that makes the race survivable: a refused mount never
+  leaves the application holding a descriptor.
 - **Negative controls**, because a green test proves nothing until it has been
   seen to fail: the race test was first run against the vulnerable version to
   confirm it catches it; the concurrency test was confirmed to fail with the
   work moved back onto the connection thread; the pidfd path was confirmed to
   be the one actually taken by making the fallback `panic!` and watching the
-  suite still pass.
+  suite still pass; the mount-identity check of 5.5 was disabled, and the
+  daemon then unmounted the stranger's filesystem, which is the bug the check
+  exists for.
 - **Clean-environment runs.** Build, `fmt`, `clippy`, `make install` and the
   full suite on Debian 12, Fedora 42 and Ubuntu 24.04 in containers, with
   nothing skipped. This is where section 6.2 came from.
@@ -365,20 +478,11 @@ documentation will need to state:
 - **Should the first mount by an application prompt the user?** Policy is
   static now, which is what makes the design cheap. A prompt would make it a UI
   portal, with the Request/Response machinery that implies.
-- **Does this overlap the document portal**, which already runs a FUSE
-  filesystem of its own and already has an fd-based contract with sandboxed
-  apps?
 - **What happens to mounts when the portal restarts?** Mine keeps its records
   in memory and loses the ability to unmount across a restart. A real
   implementation probably wants them to survive, which means state on disk and
-  a way to re-adopt mounts.
-- **The app id proves less than it looks like.** A process that can create a
-  user namespace can chroot into a forged root and claim any app id — I
-  verified this by doing it, including taking over another app's mount. It
-  gains nothing, because such a process is unsandboxed and can run
-  `fusermount3` directly; what matters is that the callers this policy governs
-  cannot do it. But it means the app id identifies sandboxed callers and is
-  meaningless from anyone else, which a specification should say out loud.
+  a way to re-adopt mounts — and, given 5.5, a mount identity that survives a
+  restart too.
 
 ## 11. Known limits of the design as it stands
 
@@ -389,6 +493,12 @@ documentation will need to state:
   an entry that was there throughout. Dropping only after two readings agree
   makes this rare, not impossible. The failure mode is a refusal to unmount
   later, never an unwanted removal.
+- The mount-identity check of 5.5 is exact only on Linux 6.8 and newer. Below
+  that the kernel offers no identifier that is not recycled, so a mount that
+  replaced ours at the same path, quickly enough to inherit its number, is
+  indistinguishable from ours. The window is narrow and the consequence is
+  bounded — a FUSE mount of the user's own, inside the portal's own root,
+  removed when it should not have been — but it is not zero.
 - The mount root is only as safe as the calling application's other
   permissions. An app that also holds `--filesystem=home` can rearrange the
   root directly, and this portal is not what stands between it and the user's
