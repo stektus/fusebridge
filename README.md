@@ -44,20 +44,25 @@ built is a narrow, auditable contract for requesting it. Three layers:
    mountpoint, journal) and runs the host's own `fusermount3`. The filesystem
    daemon stays inside the sandbox; only the attach happens outside.
 2. **The fallback** — no helper installed? The app serves WebDAV/SFTP on
-   localhost and the desktop's own userspace VFS (gvfs, kio-fuse) makes it
-   visible to every program. Slower, but works straight from the store with
-   zero host-side setup.
+   localhost and the desktop's own userspace VFS (gvfs, kio-fuse) mounts
+   that, under `/run/user/<uid>/`. Any program handed that path can read it;
+   what varies is whether the desktop hands out the path or a `sftp://`-style
+   URI only its own file layer understands. Slower than a real mount, but it
+   works straight from the store with zero host-side setup.
 3. **The spec** — a threat model (mountpoint shadowing, TOCTOU, foreign
    unmount) and a D-Bus interface written up as a draft for the portal issue
    above, with this repository as the reference implementation.
 
 ## How the bridge works
 
-FUSE libraries (libfuse, go-fuse, bazil/fuse — hence rclone, borg, gocryptfs)
-do not call `mount(2)` themselves: they exec `fusermount3` with the
-`_FUSE_COMMFD` environment variable pointing at a unix socket and expect the
-opened `/dev/fuse` fd back over it. That socket is the entire contract, and
-fd passing is native to D-Bus. So:
+A FUSE library with no privileges does not attach the filesystem from the
+application's own process. libfuse, go-fuse and bazil/fuse — hence rclone,
+borg, gocryptfs — exec `fusermount3` with the `_FUSE_COMMFD` environment
+variable pointing at a unix socket, and expect the opened `/dev/fuse` fd
+back over it. (Running as root, or handed a `/dev/fuse` fd some other way, a
+library can mount directly. The bridge is for the unprivileged path, which
+is the one a sandbox is stuck with.) That socket carries the whole of the
+attach step, and fd passing is native to D-Bus. So:
 
 - **`fusebridge-shim`** is installed inside the sandbox as
   `/app/bin/fusermount3`. It forwards the socket and the mount arguments to
@@ -76,8 +81,11 @@ fd passing is native to D-Bus. So:
 
 Policy enforced by the daemon, one journal line per operation:
 
-- the caller must be a Flatpak app (`/proc/<pid>/root/.flatpak-info`, same
-  uid); its app id is logged;
+- the caller must be a Flatpak app running as the same user
+  (`/proc/<pid>/root/.flatpak-info`); it is pinned by the pidfd the bus
+  supplies, not by its pid, so a caller that hands its connection to another
+  process and exits cannot be mistaken for whoever inherits the number. Its
+  app id is logged;
 - the mountpoint must be an empty, user-owned directory strictly inside an
   allowed root (default `~/CloudDrives`) — this is the defence against
   mounting over `~/.ssh` and similar shadowing attacks;

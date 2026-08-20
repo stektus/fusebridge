@@ -57,7 +57,12 @@ const UNSUPPORTED_OPTIONS: &[(&str, &str)] = &[(
 
 pub fn check_options(options: &[String]) -> Result<(), String> {
     for opt in options {
-        let key = opt.split('=').next().unwrap_or(opt);
+        // The key is trimmed before it is compared. `fusermount3` happens to
+        // refuse "allow_other " as an unknown option today (checked on fuse
+        // 3.18.2), but a rule this daemon enforces must not depend on the
+        // spelling somebody else's parser tolerates. The option is still
+        // passed on exactly as it arrived; only the comparison is trimmed.
+        let key = opt.split('=').next().unwrap_or(opt).trim();
         if FORBIDDEN_OPTIONS.contains(&key) {
             return Err(format!("mount option '{key}' is not allowed"));
         }
@@ -253,9 +258,43 @@ mod tests {
         assert!(check_options(&["rw".into(), "fsname=x".into()]).is_ok());
     }
 
+    /// A caller that speaks D-Bus directly is not restricted to what the
+    /// shim would produce, so every encoding of the forbidden options has to
+    /// be refused here rather than left to fusermount3.
     #[test]
     fn rejects_option_smuggling() {
-        assert!(check_options(&["rw,allow_other".into()]).is_err());
+        for smuggled in [
+            "allow_other",
+            "allow_root",
+            "rw,allow_other",
+            "allow_other,rw",
+            "fsname=x,allow_other",
+            // a value is not a hiding place: the key is what is compared
+            "allow_other=1",
+            "allow_other=",
+            // nor is a comma inside a value, which is refused as malformed
+            "fsname=a,allow_other,b",
+            "subtype=x,allow_root",
+            // padded, so the refusal does not depend on fusermount3 being
+            // strict about whitespace
+            "allow_other ",
+            " allow_other",
+            "\tallow_other\t",
+            " allow_other =1",
+            " auto_unmount ",
+        ] {
+            assert!(
+                check_options(&[smuggled.into()]).is_err(),
+                "accepted '{smuggled}'"
+            );
+        }
+    }
+
+    /// Trimming is for the comparison only — ordinary options, including
+    /// values that legitimately contain spaces, still go through.
+    #[test]
+    fn ordinary_options_still_pass() {
+        assert!(check_options(&["rw".into(), "fsname=my drive".into()]).is_ok());
     }
 
     #[test]

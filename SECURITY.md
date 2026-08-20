@@ -80,13 +80,43 @@ happens outside, and the `/dev/fuse` descriptor is passed back in.
 | Fill the session's mount table | A ceiling on live mounts (`--max-mounts`, 64 by default) | `enforces_the_mount_limit` |
 | Freeze the daemon for everyone | Mountpoint resolution runs on its own thread with a deadline; abandoned checks are counted and capped | `an_unresponsive_filesystem_cannot_wedge_the_daemon` |
 | Make other applications wait | Every request is served on its own worker; mountpoints are claimed so two requests cannot race for one | `a_stuck_request_does_not_hold_up_another_application`, `several_applications_can_mount_at_once` |
-| Impersonate another app by pid reuse | `/proc/<pid>` is opened once and everything is read through that handle | `dead_pid_is_an_error_not_an_identity` |
+| Impersonate another app by pid reuse, or by handing the bus connection to another process and exiting | The caller is pinned by the pidfd the bus captured together with the pid, confirmed still current after `/proc/<pid>` is opened; uid and app id are then both read through that one handle | `a_pidfd_pins_this_process`, `a_pidfd_whose_process_died_is_refused`, `dead_pid_is_an_error_not_an_identity`, and see below |
 | Have the daemon unmount somebody else's filesystem | A mount is removed only if it went from connected to disconnected exactly when the daemon dropped its descriptor | `only_a_mount_that_died_with_our_descriptor_is_ours`, `a_stranger_s_filesystem_is_never_unmounted` |
 | Be handed a mount option that quietly does nothing | `auto_unmount` is refused, because the bridge holds the socket the helper watches | `refuses_auto_unmount_rather_than_pretending` |
 
 The tests live in [daemon/tests/attacks.rs](daemon/tests/attacks.rs) and
 `daemon/src/*.rs`; `cargo test` runs them against a real daemon on a private
 bus, making real FUSE mounts.
+
+## Binding a request to a caller
+
+Every decision the daemon makes — may this caller mount at all, whose mount
+is this, may this caller remove it — rests on identifying the process at the
+other end of the connection. A pid is a poor handle for that. The bus reads
+it once, when the connection is made, and a connection can outlive the
+process that opened it: a caller may pass its bus socket to another process
+over `SCM_RIGHTS` and exit, after which the bus still reports a pid that
+names nobody, and then eventually names somebody else.
+
+So the caller is pinned by descriptor. `GetConnectionCredentials` carries a
+pidfd (`ProcessFD`, dbus >= 1.16) obtained at the same moment as the pid.
+The daemon reads the pid *from that pidfd*, opens `/proc/<pid>`, and reads
+the pidfd again. A pidfd whose process has been reaped reports `Pid: -1`
+from then on, so a second reading that still names the same pid proves the
+number was never released in between — and therefore that the `/proc` entry
+opened between the two readings cannot have belonged to anyone else. Both
+facts the policy uses, the uid and the app id, are then read through that
+one pinned handle, so they cannot describe two different processes.
+
+Verified on Linux 6.18: a live pidfd reports its pid, and the same pidfd
+reports `Pid: -1` once the process is killed and reaped. That the pidfd path
+is the one actually taken is not assumed either — making the fallback below
+`panic!` leaves the whole attack suite passing, so every caller in it is
+identified this way.
+
+On a bus too old to supply a pidfd the daemon falls back to the pid and says
+so in the journal at startup. The `/proc` handle is just as stable there;
+what is weaker is the claim that the pid named the caller in the first place.
 
 ## The one that needed more than a check
 
@@ -127,6 +157,20 @@ That last distinction was not there at first, and its absence was a bug: a
 crashed filesystem elsewhere in the session, appearing during a request,
 matched everything the daemon then looked at.
 
+Note where that argument is needed and where it is not. Reasoning about
+which mount in the session is the daemon's only arises on the revert path,
+because that is where the daemon removes something — and there it is
+airtight, since the daemon is the one letting go of the descriptor and can
+argue from cause. A mount that *succeeded* needs no such reasoning: it is
+recorded under the directory that was approved and verified, which is the
+same key an unmount request is matched against.
+
+What is best-effort is forgetting: `sweep_stale` drops records whose mounts
+have gone, and it decides that from `/proc/self/mountinfo`, which can come
+back inconsistent. The worst it can do is drop a record too early, and the
+cost of that is an unmount the daemon afterwards declines to perform. It
+never causes a removal. The strong rule guards the half that can.
+
 Residual risk: the misplaced mount exists, dead, for the few milliseconds
 between the mount and its removal. Closing that properly needs
 `fusermount3` to accept a directory descriptor instead of a path — a change
@@ -150,6 +194,15 @@ upstream, and one of the concrete proposals this project carries to
 - **The bridge works for more than one FUSE library.** Verified with rclone
   (a Go implementation) inside a Flatpak sandbox, and with sshfs (libfuse 3,
   C) through the shim: mount, read, write, unmount.
+- **`fusermount3` accepts only options it knows, and drops the dangerous
+  ones.** An invented option is refused outright (`unknown option
+  'totally_made_up_option'`), and asking for `suid` or `dev` is answered with
+  `unsafe option ... ignored` — the resulting mount is `nosuid,nodev`
+  regardless of what was requested. Checked on fuse 3.18.2 by driving the
+  helper directly. This bounds what "options are passed through" can mean,
+  but it is the helper's rule, not this daemon's, so the daemon does not lean
+  on it: the options it forbids, it refuses itself, including padded
+  spellings the helper happens to reject today.
 
 ## Known limits
 
@@ -166,7 +219,7 @@ upstream, and one of the concrete proposals this project carries to
   and never because the read failed — but two readings are not a proof.
 - **Mount options other than the refused ones are passed through** to
   `fusermount3` as the application gave them. The daemon does not attempt to
-  understand them.
+  understand them; it relies on nothing about them either (see above).
 - **The mount root is only as safe as the application's other permissions.**
   If an application also holds broad filesystem access (`--filesystem=home`
   or `host`), it can rearrange the mount root directly, and the bridge is

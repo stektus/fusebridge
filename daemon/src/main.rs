@@ -125,6 +125,12 @@ impl Drop for Reservation {
 impl State {
     /// Resolve and authorize the D-Bus caller. Only same-uid processes are
     /// accepted; Flatpak identity is required unless --allow-unsandboxed.
+    ///
+    /// Both facts about the caller — its uid and its app id — are read
+    /// through one pinned handle on its `/proc` entry, so they cannot come
+    /// from two different processes. The bus's own `UnixUserID` is not used
+    /// for the decision: it was captured when the connection was made, and
+    /// the connection can outlive the process that opened it.
     fn identify_caller(&self, sender: &str) -> Result<Caller, zbus::fdo::Error> {
         let sender = zbus::names::BusName::try_from(sender)
             .map_err(|e| zbus::fdo::Error::Failed(format!("unusable sender name: {e}")))?;
@@ -132,18 +138,29 @@ impl State {
             .creds
             .get_connection_credentials(sender)
             .map_err(|e| zbus::fdo::Error::Failed(format!("cannot get caller credentials: {e}")))?;
-        let pid = creds
-            .process_id()
-            .ok_or_else(|| zbus::fdo::Error::AccessDenied("caller pid unavailable".into()))?;
-        let uid = creds
-            .unix_user_id()
-            .ok_or_else(|| zbus::fdo::Error::AccessDenied("caller uid unavailable".into()))?;
+
+        let denied = |e: std::io::Error| zbus::fdo::Error::AccessDenied(format!("caller: {e}"));
+        let pinned = match creds.process_fd() {
+            Some(pidfd) => flatpak::pin_by_pidfd(pidfd.as_fd()).map_err(denied)?,
+            // dbus < 1.16 does not offer a pidfd; warned about once at startup.
+            None => {
+                let pid = creds.process_id().ok_or_else(|| {
+                    zbus::fdo::Error::AccessDenied("caller pid unavailable".into())
+                })?;
+                flatpak::pin_by_pid(pid).map_err(denied)?
+            }
+        };
+        let pid = pinned.pid();
+
+        let uid = pinned
+            .uid()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("cannot read caller uid: {e}")))?;
         if uid != unsafe { libc::geteuid() } {
             return Err(zbus::fdo::Error::AccessDenied(format!(
                 "caller uid {uid} does not match session user"
             )));
         }
-        match flatpak::app_id_of_pid(pid) {
+        match pinned.app_id() {
             Ok(Some(app_id)) => Ok(Caller { pid, app_id }),
             Ok(None) if self.allow_unsandboxed => Ok(Caller {
                 pid,
@@ -826,6 +843,24 @@ fn main() {
         error!("cannot create bus proxy: {e}");
         std::process::exit(1);
     });
+
+    // Ask the bus about this very connection: if it cannot supply a pidfd,
+    // no caller will get one either, and identity rests on a pid the bus
+    // captured at connection time. Worth saying out loud once.
+    let own_pidfd = creds_conn.unique_name().and_then(|name| {
+        let name = zbus::names::BusName::from(name.inner().clone());
+        creds
+            .get_connection_credentials(name)
+            .ok()
+            .map(|c| c.process_fd().is_some())
+    });
+    if own_pidfd == Some(false) {
+        warn!(
+            "this bus does not supply caller pidfds (needs dbus >= 1.16): callers are \
+             identified by pid, which a caller that hands off its connection and exits \
+             can make stale"
+        );
+    }
 
     let bridge = Bridge {
         state: Arc::new(State {
