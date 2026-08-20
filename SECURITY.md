@@ -114,6 +114,27 @@ is the one actually taken is not assumed either — making the fallback below
 `panic!` leaves the whole attack suite passing, so every caller in it is
 identified this way.
 
+**How much this is worth, honestly.** A Flatpak application does not hold
+the bus connection itself. Checked on this machine: the process the bus
+reports is `xdg-dbus-proxy`, child of `bwrap`, running in the host's pid
+namespace but in the *sandbox's* mount namespace — which is exactly why
+`/proc/<pid>/root/.flatpak-info` describes the application. The proxy is
+started by Flatpak and does not hand its connection around, so the
+socket-handoff above is not a move a sandboxed application can make. What
+the pinning buys against such a caller is narrower: the proxy can still exit
+between the bus's reading and the daemon's, and then a bare pid could name
+whatever took the number. It is the right way round either way — the
+identity is read from a handle instead of assumed from a number — and it is
+what upstream xdg-desktop-portal's own code has a TODO for, having read
+`.flatpak-info` by bare pid ("we can use pidfd to make sure we didn't race
+for sure", `shared/xdp-app-info-flatpak.c`).
+
+This also means the app id is only as trustworthy as the sandbox's
+`.flatpak-info`, which bwrap mounts read-only, and the proxy's mount
+namespace, which the application cannot alter — it holds no privilege to
+mount inside it, and the mounts this daemon makes land in the *host*
+namespace, not the sandbox's.
+
 On a bus too old to supply a pidfd the daemon falls back to the pid and says
 so in the journal at startup. The `/proc` handle is just as stable there;
 what is weaker is the claim that the pid named the caller in the first place.

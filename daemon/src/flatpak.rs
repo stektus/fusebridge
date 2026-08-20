@@ -8,16 +8,21 @@
 //! describing whichever process inherited the number.
 //!
 //! A pid on its own is a number, though, and the bus captured it when the
-//! connection was made. A caller can hand its bus socket to another process
-//! over `SCM_RIGHTS` and exit: the connection stays open, the bus keeps
-//! reporting the pid of a process that no longer exists, and once that
-//! number comes round again it names somebody else's application. So the
+//! connection was made — it says who connected, not who is alive now. So the
 //! process is pinned by descriptor instead, using the pidfd the bus obtained
 //! at the same moment as the pid (`ProcessFD`, dbus >= 1.16). The pid is
 //! read from the pidfd, `/proc/<pid>` is opened, and the pidfd is read
 //! again: a pidfd whose process has been reaped reports `Pid: -1` for ever
 //! after, so a second reading that still names the same pid proves the
 //! number was never freed, and therefore never belonged to anyone else.
+//!
+//! Note whose process this is. A Flatpak application does not hold the bus
+//! connection itself: the peer is its `xdg-dbus-proxy`, running in the
+//! sandbox's mount namespace, which is why `root/.flatpak-info` read through
+//! it describes the application. So this is not a defence against an
+//! application passing its connection elsewhere and exiting — it cannot do
+//! that — but against the ordinary case of the peer exiting mid-request and
+//! its number being taken by somebody else before the daemon reads it.
 //!
 //! Note what this does and does not prove. A process that can create a user
 //! namespace can chroot into a forged root and claim any app id — verified
