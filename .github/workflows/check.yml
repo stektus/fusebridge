@@ -1,0 +1,36 @@
+# What `make check` does, on a machine that is not the author's.
+#
+# The attack suite makes real FUSE mounts. Where /dev/fuse or fusermount3 is
+# unavailable each such test says so and returns rather than failing, so a
+# runner without FUSE still checks everything that does not need it.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE, D-Bus and the musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 dbus
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Say what the environment offers
+        run: |
+          fusermount3 --version || true
+          dbus-daemon --version | head -1 || true
+          test -c /dev/fuse && echo "/dev/fuse: present" || echo "/dev/fuse: ABSENT — mount tests will skip"
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release -p fusebridge-daemon
+      - run: cargo build --release -p fusebridge-shim --target x86_64-unknown-linux-musl
+      - run: cargo test -- --nocapture

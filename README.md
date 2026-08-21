@@ -4,23 +4,41 @@ FUSE mounts for sandboxed apps — without handing the app the keys to the host.
 
 ## Status
 
-**Working prototype, hardened against the attacks it claims to stop, and
-installable.** The bridge (daemon + shim) performs a full
-mount → I/O → unmount cycle for two unmodified applications — rclone (a Go
-FUSE implementation) inside a Flatpak sandbox, and sshfs (libfuse 3) through
-the shim — with the mount visible to the whole host. Every policy rule is
-exercised by the test suite against a real daemon making real mounts,
-including the mountpoint-shadowing race; the threat model is written down in
-[SECURITY.md](SECURITY.md). `make install` sets up D-Bus activation, verified
-by watching the daemon start on the first call. Requests are served
-concurrently, so no application can make another wait on it. `auto_unmount`
-works: kill the application and its mount goes with it. The zero-install
-fallback (layer 2) is verified live on KDE (kio-fuse/WebDAV) and GNOME
-(gvfs/SFTP). It builds and passes its tests on clean Debian 12, Fedora 42 and
-Ubuntu 24.04 as well as the machine it was written on. The interface and the
-threat model are written up as a portal proposal in
-[docs/portal-proposal.md](docs/portal-proposal.md), which has not been sent
-anywhere yet.
+**A working prototype, not a product.** It does the whole job for real
+applications and is tested against the attacks it claims to stop; it is not
+packaged, released or reviewed by anyone but its author.
+
+What works — each of these backed by a run, not by an argument:
+
+- a full mount → I/O → unmount cycle for two **unmodified** applications:
+  rclone (a Go FUSE implementation) inside a real Flatpak sandbox, and sshfs
+  (libfuse 3) through the shim, with the mount visible to the whole host;
+- every policy rule, exercised by the suite against a real daemon making real
+  FUSE mounts — including the mountpoint-shadowing race. [SECURITY.md](SECURITY.md)
+  says which test backs which claim;
+- `auto_unmount`: kill the application and its mount goes with it;
+- D-Bus activation from `make install`, watched starting the daemon on the
+  first call;
+- concurrent requests, so one application cannot make the others wait;
+- builds and passes its tests on clean Debian 12, Fedora 42 and Ubuntu 24.04
+  as well as the machine it was written on;
+- the zero-install fallback (layer 2 below), live on KDE (kio-fuse/WebDAV)
+  and GNOME (gvfs/SFTP).
+
+What is not there yet:
+
+- **no release and no package** — installing means building from source,
+  which is fine for a developer and not fine for a user;
+- **the daemon has to be on the host.** An application from a store cannot
+  assume it is, which is what layer 2 exists for;
+- `allow_other`/`allow_root` are refused by design, so the mount is not
+  reachable by other users, by root-owned services or from containers;
+- the helper's coming `--sync-init` protocol is not spoken yet (see
+  *Security*), so a future libfuse could hand the shim a form it will refuse;
+- x86_64 only. Nothing here is architecture-specific; nothing else has been
+  run;
+- the portal proposal in [docs/portal-proposal.md](docs/portal-proposal.md)
+  has not been sent anywhere.
 
 ## The problem
 
@@ -56,9 +74,9 @@ built is a narrow, auditable contract for requesting it. Three layers:
    unmount) and a D-Bus interface, written up in
    [docs/portal-proposal.md](docs/portal-proposal.md) as a proposal for the
    portal issue above, with this repository as the reference implementation.
-   It also carries one request to libfuse — a `fusermount3` that can mount on
-   a directory descriptor — which would remove the need for most of the
-   machinery described under *Security* below.
+   It also carries one request to libfuse: that the pinned-mountpoint fix
+   upstream already wrote should cover the code path FUSE libraries actually
+   take. See *Security*.
 
 ## How the bridge works
 
@@ -139,6 +157,25 @@ else is dead on arrival, serves nothing to anybody, and is then removed. The
 attack turns from "shadow `~/.ssh` with a filesystem you control" into "make
 a directory answer ENOTCONN for a moment".
 
+**Upstream found the same race, and has fixed half of it.** libfuse's
+maintainer describes the identical attack in commit `bad8b22c9` (11 June
+2026) — with a worse ending than the one above, a symlink into `/etc` and a
+forged sudoers drop-in — and fixes it by pinning the validated directory as a
+descriptor and mounting onto it with `move_mount(MOVE_MOUNT_T_EMPTY_PATH)`.
+Two things keep that from settling matters here. It covers the `--sync-init`
+path only; the commit says plainly that "the legacy `mount()` path and the
+library direct-mount path are unchanged", and the legacy path is the one
+every FUSE library takes without privilege and the only one a sandbox can
+reach. And it is unreleased: 3.18.2, from March 2026, is what distributions
+ship. So the machinery above stays load-bearing for as long as an unfixed
+`fusermount3` is installed anywhere.
+
+That work also brings a new way of invoking the helper —
+`fusermount3 --sync-init -o <opts> -- <mountpoint>`, with a second socket in
+`_FUSE_COMMFD2` and a signalling step — which the shim does not speak yet. It
+refuses unknown options rather than mistaking them for a mountpoint, so the
+failure is clean, but an application using it would not mount.
+
 `cargo test` runs the attack suite in [daemon/tests/attacks.rs](daemon/tests/attacks.rs)
 against a real daemon on a private bus, making real FUSE mounts: escape
 outside the allowed root, the root itself, a non-empty mountpoint, a symlink
@@ -153,6 +190,19 @@ descriptor.
 The full threat model — who the adversary is, what is out of scope, which
 test backs which claim, and what is still weak — is in
 [SECURITY.md](SECURITY.md).
+
+## Requirements
+
+- Linux with FUSE and a setuid `fusermount3` at `/usr/bin/fusermount3` — the
+  path is compiled in, and it is where Debian, Ubuntu, Fedora and Arch put it;
+- a D-Bus session bus. dbus 1.16 or newer lets the daemon identify callers by
+  descriptor; older buses work, with the caveat in [SECURITY.md](SECURITY.md);
+- Rust (stable) and `make` to build. The shim additionally needs
+  `rustup target add x86_64-unknown-linux-musl`, since it has to run on
+  whatever runtime somebody else's Flatpak uses.
+
+Nothing here needs root except `make install`, and the daemon itself never
+runs as root.
 
 ## Install
 
