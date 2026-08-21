@@ -409,6 +409,14 @@ the same, but when the whole sandbox is torn down the shim dies with it and
 nobody unmounts. The watcher has to be outside, and the thing worth watching
 is the socket.
 
+One more thing the socket buys, which a spec should say out loud. libfuse's
+new `--sync-init` protocol reverses the order: the helper hands over
+`/dev/fuse` first and attaches the mount only once the filesystem has
+answered, so a portal on that path *cannot* withhold the descriptor until it
+has checked where the mount landed. Whatever a FUSE portal ends up looking
+like, it needs a way to say "verified mount first, descriptor after" — and to
+refuse the other order rather than silently give up section 6.
+
 ## 8. One concrete request upstream, to libfuse
 
 **The pinned-mountpoint treatment in `bad8b22c9` should cover the path FUSE
