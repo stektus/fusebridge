@@ -178,7 +178,8 @@ again; what remains is to notice the date.
 Until then the strictness is available as a deliberate act:
 **`--require-pidfd`** refuses any caller the bus cannot hand over as a
 descriptor. It changes nothing on a bus that supplies them, which is pinned
-by `require_pidfd_changes_nothing_on_a_bus_that_supplies_them`.
+by `require_pidfd_matches_what_the_bus_can_do`, which checks the bus first
+and asserts the refusal where there is no pidfd to be had.
 
 The refusal itself is not left to argument either. On a real dbus 1.14.10
 (Debian 12 in a container, its own session bus, no `ProcessFD` among the
@@ -350,6 +351,15 @@ upstream, and one of the concrete proposals this project carries to
 
 ## Reporting
 
-Open an issue at https://github.com/stektus/fusebridge/issues. There is no
-release process yet and no users to coordinate with, so there is nothing to
-embargo: a public issue with a reproducer is the fastest path to a fix.
+Either of these is welcome:
+
+- **Privately**, through GitHub's [private vulnerability
+  reporting](https://github.com/stektus/fusebridge/security/advisories/new).
+  Use this if the finding is one you would rather not see public before there
+  is a fix.
+- **A public issue** with a reproducer. There is no release process yet and
+  nobody downstream to coordinate with, so for most findings there is nothing
+  to embargo, and in the open is the fastest path to a fix.
+
+If you are unsure which a finding deserves, report it privately and say so;
+moving it into the open afterwards costs nothing.

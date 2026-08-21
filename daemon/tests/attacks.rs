@@ -621,19 +621,52 @@ fn without_auto_unmount_a_closed_socket_leaves_the_mount_alone() {
 /// The refusal it causes on an older bus cannot be exercised here: this
 /// dbus always offers a pidfd, and pretending otherwise would test a mock.
 #[test]
-fn require_pidfd_changes_nothing_on_a_bus_that_supplies_them() {
+fn require_pidfd_matches_what_the_bus_can_do() {
     if !fuse_available() {
         eprintln!("skipping: /dev/fuse or fusermount3 is unavailable");
         return;
     }
     let fx = Fixture::with_args("strict", &["--allow-unsandboxed", "--require-pidfd"]);
     let dir = fx.mkdir("drive");
+    let conn = fx.connect().expect("cannot reach the private bus");
 
-    fx.mount(&dir, &[])
-        .expect("a pinned caller must still be served under --require-pidfd");
-    assert!(is_mounted(&dir));
-    fx.unmount(&dir).expect("and must still be able to unmount");
-    assert!(!is_mounted(&dir));
+    if bus_supplies_pidfd(&conn) {
+        // A bus that can hand callers over as descriptors: strictness costs
+        // the honest caller nothing.
+        fx.mount(&dir, &[])
+            .expect("a pinned caller must still be served under --require-pidfd");
+        assert!(is_mounted(&dir));
+        fx.unmount(&dir).expect("and must still be able to unmount");
+        assert!(!is_mounted(&dir));
+    } else {
+        // dbus < 1.16. The flag exists to refuse here rather than fall back
+        // to a pid, and refusing must be all it does: no mount left behind.
+        let err = fx
+            .mount(&dir, &[])
+            .expect_err("--require-pidfd must refuse where the bus cannot supply one");
+        assert!(
+            err.contains("cannot identify callers by descriptor"),
+            "the refusal must say why: {err}"
+        );
+        assert!(!is_mounted(&dir), "a refused request must leave no mount");
+    }
+}
+
+/// Does this bus hand out caller pidfds at all? `ProcessFD` arrived in
+/// dbus 1.16, and Debian 12 and Ubuntu 24.04 LTS still ship 1.14.10 — so
+/// what `--require-pidfd` is supposed to do depends on where the test runs,
+/// and the test asks instead of assuming. Both answers are checked; neither
+/// is a reason to skip.
+fn bus_supplies_pidfd(conn: &zbus::blocking::Connection) -> bool {
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(conn) else {
+        return false;
+    };
+    let Some(me) = conn.unique_name() else {
+        return false;
+    };
+    dbus.get_connection_credentials(zbus::names::BusName::from(me.as_ref()))
+        .map(|creds| creds.process_fd().is_some())
+        .unwrap_or(false)
 }
 
 /// A mount the daemon did not create is none of its business, even for a
