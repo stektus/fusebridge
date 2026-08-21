@@ -33,8 +33,10 @@ What is not there yet:
   assume it is, which is what layer 2 exists for;
 - `allow_other`/`allow_root` are refused by design, so the mount is not
   reachable by other users, by root-owned services or from containers;
-- the helper's coming `--sync-init` protocol is not spoken yet (see
-  *Security*), so a future libfuse could hand the shim a form it will refuse;
+- the helper's coming `--sync-init` protocol is not spoken yet. The shim
+  declines it by name and libfuse falls back to the protocol the bridge does
+  speak, so nothing breaks — see *Security* for why that is safe and what it
+  would take to support properly;
 - x86_64 only. Nothing here is architecture-specific; nothing else has been
   run;
 - the portal proposal in [docs/portal-proposal.md](docs/portal-proposal.md)
@@ -172,9 +174,23 @@ ship. So the machinery above stays load-bearing for as long as an unfixed
 
 That work also brings a new way of invoking the helper —
 `fusermount3 --sync-init -o <opts> -- <mountpoint>`, with a second socket in
-`_FUSE_COMMFD2` and a signalling step — which the shim does not speak yet. It
-refuses unknown options rather than mistaking them for a mountpoint, so the
-failure is clean, but an application using it would not mount.
+`_FUSE_COMMFD2` and a signalling step: the helper hands over `/dev/fuse`
+first, waits to be told the filesystem has answered FUSE_INIT, and only then
+attaches the mount. The shim does not speak it, and declines it by name in a
+millisecond. That is safe rather than fatal, for two reasons that were read
+out of libfuse master rather than assumed. `fuse_session_mount` falls back to
+the classic protocol whenever the new-API path fails ("fall back to old
+API"), and the classic protocol is the one the bridge speaks. And a sandbox
+does not reach that path at all: it begins by opening `/dev/fuse`, which is
+not present inside a Flatpak sandbox unless the application holds
+`--device=all` — the permission this project exists to avoid needing.
+
+Supporting it properly is not just protocol work. Sync-init requires the
+descriptor to reach the application *before* the mount exists, since the
+mount is completed only after the filesystem answers — the exact opposite of
+the invariant above. On that path the safety would have to come from the
+helper's own pinned mountpoint, which is why supporting it means first
+checking that the installed `fusermount3` has that fix.
 
 `cargo test` runs the attack suite in [daemon/tests/attacks.rs](daemon/tests/attacks.rs)
 against a real daemon on a private bus, making real FUSE mounts: escape

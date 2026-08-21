@@ -23,6 +23,11 @@ struct Args {
     /// arrangement, where it has already mounted by itself and wants the
     /// helper to hang around as a watchdog. See `run`.
     watchdog: bool,
+    /// `--sync-init`: libfuse's two-phase mount, where the helper hands over
+    /// `/dev/fuse` first, waits to be told the filesystem has answered
+    /// FUSE_INIT, and only then attaches the mount. Recognised so the refusal
+    /// can say what it is; see `run`.
+    sync_init: bool,
     options: Vec<String>,
     mountpoint: Option<String>,
 }
@@ -52,6 +57,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, String> {
             "-q" | "--quiet" => args.quiet = true,
             "-z" | "--lazy" => args.lazy = true,
             "--auto-unmount" => args.watchdog = true,
+            "--sync-init" => args.sync_init = true,
             "-o" | "--options" => {
                 let val = it.next().ok_or("-o requires an argument")?;
                 args.options.extend(val.split(',').map(String::from));
@@ -122,6 +128,22 @@ fn run() -> Result<(), String> {
     if args.help {
         println!("{USAGE}");
         return Ok(());
+    }
+
+    // The two-phase protocol that arrives with libfuse's new mount API. It
+    // is not implemented here, and declining is safe rather than fatal:
+    // libfuse falls back to the classic helper protocol on any failure of
+    // this path (fuse_session_mount, "fall back to old API"), and that is the
+    // protocol the bridge speaks. Declining by name, quickly, is what makes
+    // the fallback prompt — the socket closes, so libfuse sees end-of-file
+    // instead of waiting.
+    if args.sync_init {
+        return Err(
+            "--sync-init asks for the two-phase mount protocol, which this bridge does not \
+             implement yet. libfuse falls back to the classic helper protocol, \
+             which it does."
+                .into(),
+        );
     }
 
     // libfuse asks for this only after it has mounted by itself — a
@@ -241,6 +263,24 @@ mod tests {
 
     /// libfuse's other auto-unmount arrangement: it mounted by itself and
     /// wants the helper as a watchdog. Nothing to mount, so no options.
+    /// The fifth invocation form, from libfuse's new mount API. The shim has
+    /// to name it rather than meet it as an unknown option: the refusal is
+    /// what makes libfuse fall back to the protocol the bridge does speak,
+    /// and it must be recognised as a form in its own right, not mistaken
+    /// for a mountpoint.
+    #[test]
+    fn libfuse_sync_init_form_is_declined_by_name() {
+        let a = parse_args(
+            ["--sync-init", "-o", "rw,nosuid", "--", "/mnt/x"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .expect("the form must parse, so that it can be declined deliberately");
+        assert!(a.sync_init, "--sync-init must be recognised");
+        assert_eq!(a.mountpoint.as_deref(), Some("/mnt/x"));
+        assert_eq!(a.options, vec!["rw", "nosuid"]);
+    }
+
     #[test]
     fn libfuse_watchdog_form() {
         // libfuse: fusermount3 --auto-unmount -- /mnt/point
